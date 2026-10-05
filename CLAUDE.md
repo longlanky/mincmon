@@ -12,7 +12,7 @@ mincmon is a network ping monitor with a live terminal UI, written in Go (v4) un
 go run ./cmd/mincmon [flags] [IP|CIDR|domain ...]   # no targets → interactive prompts
 go test ./...                                      # resolve/probe tests use the network; skip if unavailable
 go vet ./... && GOOS=windows go vet ./... && GOOS=darwin go vet ./...
-./build.sh [os/arch ...]                           # static CGO_ENABLED=0 binaries → dist/mincmon-<os>-<arch>
+./build.sh [os/arch[/level] ...]                   # static CGO_ENABLED=0 binaries → dist/mincmon-<os>-<arch>[-<level>]
 ```
 
 Flags: `-f list.ml.txt`, `-i 2s`, `-t 1s`, `--resolver IPs|system`, `--records A|AAAA|both`, `--backend auto|icmp|raw|exec`. Go's `flag` stops at the first positional argument, so flags must come before the targets.
@@ -38,3 +38,4 @@ Flags: `-f list.ml.txt`, `-i 2s`, `-t 1s`, `--resolver IPs|system`, `--records A
 
 - Windows support is maintained: `native_windows.go` (ICMP API) and the Windows branch in `exec.go`. Keep both paths, and vet with `GOOS=windows`. The Windows ICMPv6 reply offsets (Status at 28, RTT at 32) were not tested on real Windows.
 - Release binaries must stay `CGO_ENABLED=0` (static, no libc) so they run on EL8 and older distros.
+- `build.sh` must keep pinning `GOAMD64` (default v1) and `GOARM64`. This machine's Gentoo Go toolchain defaults to `GOAMD64=v3`, so unpinned binaries crash on older CPUs. Verify with `go version -m <binary>` or `qemu-x86_64 -cpu qemu64 <binary> -version`.

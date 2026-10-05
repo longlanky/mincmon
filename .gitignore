@@ -1,3 +1,4 @@
 dist/
 # saved monitor lists are local data (may describe private infrastructure)
 *.ml.txt
+CONTINUE.sh

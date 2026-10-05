@@ -43,14 +43,20 @@ git clone git@github.com:longlanky/mincmon.git
 cd mincmon
 ./build.sh                  # all platforms → dist/
 ./build.sh linux/amd64      # or just the ones you need
+./build.sh linux/amd64/v2   # amd64 at a specific microarchitecture level
 ```
 
 `build.sh` cross-compiles static binaries for Linux, Windows, and macOS (amd64 and arm64) into `dist/`:
 
 ```
-dist/mincmon-linux-amd64        dist/mincmon-windows-amd64.exe   dist/mincmon-darwin-amd64
-dist/mincmon-linux-arm64        dist/mincmon-windows-arm64.exe   dist/mincmon-darwin-arm64
+dist/mincmon-linux-amd64-v1     dist/mincmon-windows-amd64.exe   dist/mincmon-darwin-amd64
+dist/mincmon-linux-amd64-v2     dist/mincmon-windows-arm64.exe   dist/mincmon-darwin-arm64
+dist/mincmon-linux-arm64
 ```
+
+**Which Linux amd64 build?** `-v1` runs on any 64-bit x86 CPU. `-v2` needs SSE4.2/POPCNT, which is roughly any Intel CPU since Nehalem (2008) or AMD since Bulldozer (2011). mincmon spends its time waiting on the network, so the v2 build isn't noticeably faster: use `-v1` unless you have a reason not to. The Windows and macOS amd64 builds are v1.
+
+`build.sh` always sets the amd64 level explicitly (default v1). Some Go toolchains default to the build machine's own level, and their binaries won't start on older CPUs.
 
 Copy the one you need anywhere on your `PATH`. To run straight from the source tree instead, use `go run ./cmd/mincmon`.
 
