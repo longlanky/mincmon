@@ -1,5 +1,33 @@
 # ✨ mincmon Changelog
 
+## v1.2.0 — Pause, re-resolve & richer host insight 📊
+*Minor bump: new user-facing features plus a few small fixes. No breaking changes — `.ml.txt` lists, flags and keys you already use behave exactly as before.*
+
+> End-user TL;DR: you can now **pause and resume probing**, **re-resolve your domains without restarting**, see **RTT min/avg/max + jitter** for the selected host, and hit **`?` anytime for a full key reference**. Quitting is also instant now. 🎉
+
+### 🆕 New features — what you get
+
+* ⏸ **Pause / resume probing (`p`)** — suspend all probing with one keypress (useful on metered links, laptops, or while debugging a network). A probe already in flight finishes and is recorded; no new probes are sent until you press `p` again. The title bar shows a clear **`⏸ PAUSED`** badge so you never wonder why nothing is updating. Impact: no more killing the app just to take a break from probing. 🧘
+* 🔄 **Selective domain re-resolve (`R`)** — domains move (CDNs, failovers, dynamic DNS). Press `R` and choose **which** domains to refresh (blank = all), then choose the resolver: **blank uses each domain's original resolver**, `system` forces the system one, or an explicit IP list overrides for that run. mincmon remembers which resolver produced each entry (a new optional third field in `.ml.txt`; old files load unchanged), and re-resolve queries every server that ever produced a label so DNS changes from any of them are seen. The footer detail line now shows the provenance (`via 10.0.0.53` / `via system DNS`). Impact: DNS changes show up in seconds, per-domain — no restart, no re-adding everything. 🚀
+* 📈 **RTT statistics for the selected host** — the footer detail line now shows **min / avg / max RTT, jitter (max−min), and total probes sent**, computed over the last 60 probes. Impact: spot latency spikes and flakiness at a glance instead of eyeballing the sparkline. 🔬
+* ❓ **Help overlay (`?`)** — a full key reference covering everything, including the keys that were never shown in the hint bar (`j/k`, `g/G`, pgup/pgdn, space, Esc clears filter). Any key closes it. Impact: no more reading the README mid-session. 📖
+
+### 🐛 Fixes — quieter, tidier under the hood
+
+* ⚡ **Quitting is now instant** — `q` / Ctrl+C used to stop every worker (blocking on in-flight probes) *before* closing the UI, so quitting with slow or timing-out hosts could freeze the screen for up to a timeout. Now the UI closes immediately and workers are stopped right after. Impact: no more "hang on quit". 👋
+* 🧵 **No more stranded prompts on quit** — quitting while an add/remove/save prompt was open left its background flow goroutine blocked forever. It is now cancelled cleanly. Impact: tidy shutdowns, always. 🧹
+* 🖥️ **Startup error path no longer double-closes the probe backend** — a bad `-f` file closed the backend twice; the second close's error was silently dropped. Impact: cleaner startup failures. 🚪
+* 🔎 **`ping6` binary lookup only happens for IPv6** — the fallback backend searched for `ping6` even in IPv4-only mode, wasting a PATH scan at startup. Impact: negligible, but it's correct now. 🐧
+* 🧾 **Record-type parsing de-duplicated** — the interactive and strict parsers were two copies of the same logic that could drift. They now share one implementation. Impact: future parsing fixes land in both paths. 🔧
+
+### 🧪 Tested
+
+* New monitor test covers pause → no probes sent → resume → probing continues. 🤖
+* `go test ./...` green; `go vet` clean on Linux, **Windows and macOS** cross-compilation. ✅
+
+---
+*Upgrade: replace the binary (`./build.sh`), keep your `.ml.txt` files — fully compatible. New keys: `p` pause, `R` re-resolve, `?` help. Note: `--resolver`-flagged runs re-resolve **all** domains with the flagged resolvers (the interactive domain picker only appears without the flag).*
+
 ## v1.1.0 — Stability & correctness pass 🛠️
 *Previous release treated as `1.0.0`. This is a **minor bump to `1.1.0`**: lots of bug fixes + user-visible reliability wins, no major breaking changes.*
 

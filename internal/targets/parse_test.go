@@ -136,8 +136,10 @@ func TestHostCount(t *testing.T) {
 
 func TestDedupe(t *testing.T) {
 	a, b := netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("2.2.2.2")
-	got := Dedupe([]Target{{a, "a.com"}, {a, "b.com"}, {b, ""}, {b, "c.com"}, {a, "a.com"}})
-	want := []Target{{a, "a.com, b.com"}, {b, "c.com"}}
+	r1, r2 := netip.MustParseAddr("10.0.0.53"), netip.MustParseAddr("10.0.1.53")
+	got := Dedupe([]Target{{Addr: a, Domain: "a.com", Resolver: r1}, {Addr: a, Domain: "b.com"},
+		{Addr: b, Domain: ""}, {Addr: b, Domain: "c.com"}, {Addr: a, Domain: "a.com", Resolver: r2}})
+	want := []Target{{Addr: a, Domain: "a.com, b.com", Resolver: r1}, {Addr: b, Domain: "c.com"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Dedupe = %v, want %v", got, want)
 	}

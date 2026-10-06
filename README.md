@@ -154,8 +154,11 @@ Any single subnet or refinement is capped at 1024 hosts.
 | `d` / `Delete` | Remove the selected host immediately. |
 | `s` | Save the current hosts to a `.ml.txt` file. |
 | `l` | Load a `.ml.txt` file from the current directory, or by path. |
+| `R` | Re-resolve domains: pick one/some/blank=all; resolver blank uses each domain's original resolver (saved provenance), `system`, or explicit IP(s). New addresses are added automatically. |
+| `p` | Pause / resume probing (an in-flight probe finishes; `⏸ PAUSED` shows in the title bar). |
 | `o` / `O` | Cycle the sort column (added, IP, domain, state, latency, loss) / reverse it. |
 | `/` | Filter by IP, domain, or state. `Esc` clears the filter. |
+| `?` | Toggle the full-screen key reference. |
 | `q` / `Ctrl+C` | Quit. |
 
 In a prompt, `Enter` submits and `Esc` cancels.
@@ -168,19 +171,22 @@ In a prompt, `Enter` submits and `Esc` cancels.
 - **UP / DOWN:** total successful and failed probes since the host was added.
 - **HISTORY:** recent round-trip times, newest on the right, scaled to each host's own peak. `×` marks a lost probe.
 
-The line under the table shows the selected host's state and when that state began, plus the last probe error if there was one other than a plain timeout.
+The line under the table shows the selected host's state and when that state began, plus the last probe error if there was one other than a plain timeout. It also shows the host's RTT min/avg/max, jitter, and total probes sent over the last 60 probes.
 
 ## Monitor list files
 
-Saved lists are plain text with the `.ml.txt` extension. Each line holds one host: the IP, a comma, and an optional domain label.
+Saved lists are plain text with the `.ml.txt` extension. Each line holds one host: the IP, a comma, and an optional domain label. An optional third field records the DNS resolver that produced the entry.
 
 ```
 192.0.2.10,web.example.com
+192.0.2.10,web.example.com,10.0.0.53
 192.0.2.12,
 2001:db8::10,web.example.com, www.example.com
 ```
 
-Lines are split on the **first** comma only. If one IP was resolved from several domains, its label lists them all (`web.example.com, www.example.com`). Lines with an invalid IP are skipped.
+Lines are split on the **first** comma only. If one IP was resolved from several domains, its label lists them all (`web.example.com, www.example.com`). A segment after the **last** comma that parses as an IP address is the resolver (domain names can never be IPs, so merged labels are never mistaken for one). Lines with an invalid IP are skipped.
+
+The resolver field is provenance: re-resolving a domain (`R`, blank resolver) queries the server that originally produced it — or the system resolver when omitted. Lists saved by older versions (two fields only) load unchanged.
 
 The repo's `.gitignore` excludes `*.ml.txt`, because saved lists tend to describe private infrastructure.
 

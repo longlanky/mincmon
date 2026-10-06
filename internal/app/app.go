@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -123,29 +124,23 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 		wantA, wantAAAA = ParseRecords(raw)
 	}
 	for _, d := range domains {
-		addrs := resolve.Domain(d, resolvers, wantA, wantAAAA)
-		if len(addrs) == 0 {
+		results := resolve.DomainDetailed(d, resolvers, wantA, wantAAAA)
+		if len(results) == 0 {
 			p.Notify(fmt.Sprintf("! No records resolved for %s.", d))
 		}
-		for _, a := range addrs {
-			out = append(out, targets.Target{Addr: a, Domain: d})
+		for _, r := range results {
+			out = append(out, targets.Target{Addr: r.Addr, Domain: d, Resolver: r.Resolver})
 		}
 	}
 	return out, nil
 }
 
-// ParseRecords maps "A", "AAAA", "both"/blank to record types.
-// Anything else returns an error instead of silently defaulting to both.
+// ParseRecords maps "A", "AAAA", "both"/blank to record types. Invalid
+// input falls back to "both" so interactive users are never blocked on a
+// typo (the strict variant reports it instead).
 func ParseRecords(s string) (wantA, wantAAAA bool) {
-	switch t := strings.ToUpper(strings.TrimSpace(s)); t {
-	case "A":
-		return true, false
-	case "AAAA":
-		return false, true
-	case "", "BOTH", "A,AAAA", "AAAA,A":
-		return true, true
-	}
-	return true, true
+	wantA, wantAAAA, _ = ParseRecordsStrict(s)
+	return wantA, wantAAAA
 }
 
 // ParseRecordsStrict is like ParseRecords but reports invalid input.
@@ -331,4 +326,133 @@ func Load(m *monitor.Monitor, p Prompter) string {
 		return fmt.Sprintf("%s (0 new - already monitored).", msg)
 	}
 	return fmt.Sprintf("%s (%d new).", msg, len(added))
+}
+
+// Reresolve re-resolves selected domain labels currently monitored and
+// adds any new addresses (existing hosts keep their state and history).
+// The user picks which domains (blank = all) and the resolver: blank uses
+// each domain's original resolver (recorded provenance), "system" forces
+// the system resolver, or an explicit IP list overrides for this run.
+func Reresolve(m *monitor.Monitor, p Prompter, opt DNSOptions) string {
+	// label -> set of resolvers that produced it (empty set = system).
+	provenance := map[string]map[netip.Addr]bool{}
+	for _, t := range m.Targets() {
+		for _, l := range strings.Split(t.Domain, ",") {
+			if l = strings.TrimSpace(l); l != "" {
+				if provenance[l] == nil {
+					provenance[l] = map[netip.Addr]bool{}
+				}
+				if t.Resolver.IsValid() {
+					provenance[l][t.Resolver] = true
+				}
+			}
+		}
+	}
+	if len(provenance) == 0 {
+		return "No domain-labelled hosts to re-resolve."
+	}
+
+	// Which domains?
+	names := make([]string, 0, len(provenance))
+	for l := range provenance {
+		names = append(names, l)
+	}
+	sort.Strings(names)
+	selected := names
+	if !opt.ResolversSet { // domain picker only makes sense interactively
+		raw, err := p.Prompt(fmt.Sprintf(
+			"Re-resolve which domain(s)? (comma separated; blank = all %d): ", len(names)))
+		if err != nil {
+			return "Re-resolve cancelled."
+		}
+		if raw = strings.TrimSpace(raw); raw != "" {
+			selected = nil
+			for _, s := range strings.Split(raw, ",") {
+				s = strings.TrimSpace(s)
+				match := ""
+				for _, n := range names {
+					if strings.EqualFold(n, s) {
+						match = n
+						break
+					}
+				}
+				if match == "" {
+					p.Notify(fmt.Sprintf("! %q is not a monitored domain label; skipped.", s))
+					continue
+				}
+				selected = append(selected, match)
+			}
+			if len(selected) == 0 {
+				return "No monitored domains matched."
+			}
+		}
+	}
+
+	// Which resolver?
+	var override []netip.Addr
+	useOverride := false
+	switch {
+	case opt.ResolversSet:
+		override, useOverride = opt.Resolvers, true
+	default:
+		raw, err := p.Prompt("Resolver: blank = each domain's original, \"system\", or IP(s) comma separated: ")
+		if err != nil {
+			return "Re-resolve cancelled."
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			// per-domain provenance (the default)
+		} else if strings.EqualFold(raw, "system") {
+			override, useOverride = nil, true
+		} else {
+			for _, r := range strings.Split(raw, ",") {
+				if r = strings.TrimSpace(r); r == "" {
+					continue
+				}
+				if a, err := netip.ParseAddr(r); err == nil {
+					override = append(override, a.WithZone(""))
+				} else {
+					p.Notify(fmt.Sprintf("! ignoring invalid resolver %q", r))
+				}
+			}
+			useOverride = true
+		}
+	}
+
+	wantA, wantAAAA := opt.WantA, opt.WantAAAA
+	if !opt.RecordsSet {
+		raw, err := p.Prompt("Resolve A records, AAAA records, or leave blank for both: ")
+		if err != nil {
+			return "Re-resolve cancelled."
+		}
+		wantA, wantAAAA = ParseRecords(raw)
+	}
+
+	var ts []targets.Target
+	changed := 0
+	for _, d := range selected {
+		resolvers := override
+		if !useOverride {
+			// Query every resolver that ever produced this label, so
+			// DNS changes from any of them are seen.
+			set := provenance[d]
+			resolvers = make([]netip.Addr, 0, len(set))
+			for r := range set {
+				resolvers = append(resolvers, r)
+			}
+			sort.Slice(resolvers, func(i, j int) bool { return resolvers[i].Less(resolvers[j]) })
+		}
+		results := resolve.DomainDetailed(d, resolvers, wantA, wantAAAA)
+		if len(results) == 0 {
+			p.Notify(fmt.Sprintf("! No records resolved for %s.", d))
+			continue
+		}
+		changed++
+		for _, r := range results {
+			ts = append(ts, targets.Target{Addr: r.Addr, Domain: d, Resolver: r.Resolver})
+		}
+	}
+	added := m.Add(targets.Dedupe(ts))
+	return fmt.Sprintf("Re-resolved %d/%d domain(s), %d new host(s).",
+		changed, len(selected), len(added))
 }

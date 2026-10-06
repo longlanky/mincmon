@@ -31,15 +31,16 @@ func (s State) String() string {
 
 // Status is a point-in-time copy of one host's state.
 type Status struct {
-	Addr    netip.Addr
-	Domain  string
-	State   State
-	Latency time.Duration // last successful RTT (valid when State == Up)
-	OK      int
-	Fail    int
-	Changed time.Time       // when State last changed
-	Err     string          // last non-timeout probe error, if any
-	History []time.Duration // oldest first; <0 marks a lost probe
+	Addr     netip.Addr
+	Domain   string
+	Resolver netip.Addr    // DNS resolver that produced this entry (zero = system)
+	State    State
+	Latency  time.Duration // last successful RTT (valid when State == Up)
+	OK       int
+	Fail     int
+	Changed  time.Time       // when State last changed
+	Err      string          // last non-timeout probe error, if any
+	History  []time.Duration // oldest first; <0 marks a lost probe
 }
 
 // Loss returns the fraction of probes lost within the history window.
@@ -74,13 +75,22 @@ type Monitor struct {
 	ctx      context.Context
 	stop     context.CancelFunc
 	wg       sync.WaitGroup
+
+	// Pause gate: while paused, resume is a fresh open channel every worker
+	// blocks on; Resume closes it to release them all at once.
+	pauseMu sync.Mutex
+	paused  bool
+	resume  chan struct{}
 }
 
 func New(p probe.Prober, interval, timeout time.Duration) *Monitor {
 	ctx, stop := context.WithCancel(context.Background())
+	resume := make(chan struct{})
+	close(resume) // start unpaused
 	return &Monitor{
 		Interval: interval, Timeout: timeout, prober: p,
 		hosts: map[netip.Addr]*host{}, ctx: ctx, stop: stop,
+		resume: resume,
 	}
 }
 
@@ -98,10 +108,13 @@ func (m *Monitor) Add(items []targets.Target) []netip.Addr {
 	for _, t := range items {
 		if h, ok := m.hosts[t.Addr]; ok {
 			mergeLabel(&h.Domain, t.Domain)
+			if !h.Resolver.IsValid() {
+				h.Resolver = t.Resolver
+			}
 			continue
 		}
 		ctx, cancel := context.WithCancel(m.ctx)
-		h := &host{Status: Status{Addr: t.Addr, Domain: t.Domain, Changed: time.Now()}, cancel: cancel}
+		h := &host{Status: Status{Addr: t.Addr, Domain: t.Domain, Resolver: t.Resolver, Changed: time.Now()}, cancel: cancel}
 		m.hosts[t.Addr] = h
 		m.order = append(m.order, t.Addr)
 		added = append(added, t.Addr)
@@ -191,18 +204,65 @@ func (m *Monitor) Snapshot() []Status {
 	return out
 }
 
-// Targets returns the monitored addresses and labels, for saving.
+// Targets returns the monitored addresses, labels and resolver
+// provenance, for saving and re-resolving.
 func (m *Monitor) Targets() []targets.Target {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]targets.Target, 0, len(m.order))
 	for _, a := range m.order {
-		out = append(out, targets.Target{Addr: a, Domain: m.hosts[a].Domain})
+		out = append(out, targets.Target{Addr: a, Domain: m.hosts[a].Domain, Resolver: m.hosts[a].Resolver})
 	}
 	return out
 }
 
 func (m *Monitor) ProberName() string { return m.prober.Name() }
+
+// Pause suspends probing for every host. A probe already in flight still
+// completes (and is recorded); no new probes are sent until Resume.
+func (m *Monitor) Pause() {
+	m.pauseMu.Lock()
+	defer m.pauseMu.Unlock()
+	if !m.paused {
+		m.paused = true
+		m.resume = make(chan struct{})
+	}
+}
+
+// Resume releases every worker blocked in Pause and probing continues.
+func (m *Monitor) Resume() {
+	m.pauseMu.Lock()
+	defer m.pauseMu.Unlock()
+	if m.paused {
+		m.paused = false
+		close(m.resume)
+	}
+}
+
+// Paused reports whether probing is currently suspended.
+func (m *Monitor) Paused() bool {
+	m.pauseMu.Lock()
+	defer m.pauseMu.Unlock()
+	return m.paused
+}
+
+// waitResume blocks while the monitor is paused. It returns false if ctx
+// was cancelled (monitor stopping or host removed) so the worker exits.
+func (m *Monitor) waitResume(ctx context.Context) bool {
+	m.pauseMu.Lock()
+	if !m.paused {
+		m.pauseMu.Unlock()
+		return true
+	}
+	ch := m.resume
+	m.pauseMu.Unlock()
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 // Stop cancels every worker and waits for them to exit.
 func (m *Monitor) Stop() {
@@ -223,6 +283,9 @@ func (m *Monitor) worker(ctx context.Context, addr netip.Addr, delay time.Durati
 	t := time.NewTicker(m.Interval)
 	defer t.Stop()
 	for {
+		if !m.waitResume(ctx) {
+			return
+		}
 		rtt, err := m.prober.Probe(ctx, addr, m.Timeout)
 		if ctx.Err() != nil {
 			return

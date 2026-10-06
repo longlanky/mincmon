@@ -55,8 +55,10 @@ func newExec(v6 bool) (Prober, error) {
 			return []string{"-c", "1", "-W", strconv.Itoa(int(t.Milliseconds())), a.String()}
 		}
 	default:
-		if _, err := exec.LookPath("ping6"); v6 && err == nil {
-			p.bin = "ping6"
+		if v6 {
+			if _, err := exec.LookPath("ping6"); err == nil {
+				p.bin = "ping6"
+			}
 		}
 		p.args = func(a netip.Addr, t time.Duration) []string {
 			// Linux ping -W is in whole seconds

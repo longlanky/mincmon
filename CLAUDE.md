@@ -31,7 +31,7 @@ Flags: `-f list.ml.txt`, `-i 2s`, `-t 1s`, `--resolver IPs|system`, `--records A
 
 ## Invariants
 
-- `.ml.txt` rows are `ip,domain`, split on the *first* comma only, because the domain field may contain merged labels like `a.com, b.com`. `infra.ml.txt` is a real saved monitor list kept locally (`*.ml.txt` is gitignored because the repo is public); `internal/store` round-trips it byte-for-byte when present and skips otherwise.
+- `.ml.txt` rows are `ip,domain` or `ip,domain,resolver`: the IP is split on the *first* comma; if the segment after the *last* comma parses as an IP address it is the DNS resolver that produced the entry (domain labels can never be IPs, so merged labels like `a.com, b.com` are never mistaken for a resolver). `infra.ml.txt` is a real saved monitor list kept locally (`*.ml.txt` is gitignored because the repo is public); `internal/store` round-trips it byte-for-byte when present and skips otherwise. `targets.Target.Resolver` (zero = system) is provenance: `R` re-resolve queries it by default.
 - Expansion without a refinement mirrors the original Python version's `ipaddress.hosts()`: IPv4 skips network and broadcast (except /31); IPv6 skips the subnet-router anycast address (except /127).
 
 ## Constraints

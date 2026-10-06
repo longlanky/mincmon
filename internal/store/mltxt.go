@@ -17,8 +17,12 @@ import (
 // Ext is the monitor-list file extension.
 const Ext = ".ml.txt"
 
-// Load reads a monitor list. Rows are split on the FIRST comma only:
-// merged labels like "a.com, b.com" live entirely in the domain field.
+// Load reads a monitor list. Rows are "ip,domain" or "ip,domain,resolver":
+// the domain field is split on the FIRST comma only, because merged labels
+// like "a.com, b.com" live entirely in the domain field. An optional third
+// field records which DNS resolver produced the entry; it is detected by
+// checking whether the segment after the last comma parses as an IP
+// address (a domain label can never be an IP, so this is unambiguous).
 // Rows with an invalid IP are skipped.
 func Load(path string) ([]targets.Target, error) {
 	items, _, err := LoadWithStats(path)
@@ -44,25 +48,52 @@ func LoadWithStats(path string) (items []targets.Target, skipped int, err error)
 		if strings.HasPrefix(line, "#") {
 			continue
 		}
-		ipS, domain, _ := strings.Cut(line, ",")
+		ipS, rest, _ := strings.Cut(line, ",")
 		ip, err := netip.ParseAddr(strings.TrimSpace(ipS))
 		if err != nil {
 			skipped++
 			continue
 		}
-		items = append(items, targets.Target{Addr: ip, Domain: strings.TrimSpace(domain)})
+		// Optional third field: an IP after the last comma is the
+		// resolver that produced this entry (domains can't be IPs, so
+		// merged labels like "a.com, b.com" never trigger this).
+		if r, ok := parseTrailingResolver(rest); ok {
+			d := strings.TrimSpace(rest[:strings.LastIndex(rest, ",")])
+			items = append(items, targets.Target{Addr: ip, Domain: d, Resolver: r})
+			continue
+		}
+		items = append(items, targets.Target{Addr: ip, Domain: strings.TrimSpace(rest)})
 	}
 	return items, skipped, sc.Err()
 }
 
+// parseTrailingResolver reports the IP after the last comma of s, if any.
+func parseTrailingResolver(s string) (netip.Addr, bool) {
+	idx := strings.LastIndex(s, ",")
+	if idx < 0 {
+		return netip.Addr{}, false
+	}
+	r, err := netip.ParseAddr(strings.TrimSpace(s[idx+1:]))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return r.WithZone(""), true
+}
+
 // Save writes a monitor list atomically (temp file + rename) and returns
-// the number of rows written. An empty list writes an empty file.
+// the number of rows written. An empty list writes an empty file. Rows
+// with a recorded resolver get an optional third field (ip,domain,resolver);
+// system-resolved rows stay two-field, so old files round-trip unchanged.
 func Save(path string, items []targets.Target) (int, error) {
 	var b strings.Builder
 	for _, t := range items {
 		b.WriteString(t.Addr.String())
 		b.WriteByte(',')
 		b.WriteString(t.Domain)
+		if t.Resolver.IsValid() {
+			b.WriteByte(',')
+			b.WriteString(t.Resolver.String())
+		}
 		b.WriteByte('\n')
 	}
 	dir := filepath.Dir(path)

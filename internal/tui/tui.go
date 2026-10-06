@@ -19,7 +19,7 @@ import (
 )
 
 // Version is shown in the title bar.
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 var (
 	stTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
@@ -101,6 +101,7 @@ type Model struct {
 
 	busy    bool
 	prompt  *promptReq
+	help    bool
 	input   textinput.Model
 	notes   []string
 	message string
@@ -144,6 +145,17 @@ func startFlow(m *Model, f func(app.Prompter) string) tea.Cmd {
 	return func() tea.Msg { return actionDone(f(p)) }
 }
 
+// cancelPrompt unblocks a waiting app-flow goroutine so quitting while a
+// prompt is open doesn't leak it (its goroutine would otherwise block on
+// the reply channel forever).
+func (m *Model) cancelPrompt() {
+	if m.prompt != nil {
+		m.prompt.reply <- promptResp{err: app.ErrCancelled}
+		m.prompt = nil
+		m.input.Blur()
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -184,7 +196,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
-			m.mon.Stop()
+			m.cancelPrompt()
 			return m, tea.Quit
 		}
 		if m.prompt != nil {
@@ -251,9 +263,16 @@ func (m Model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	// Any key closes the help overlay ("?" re-opens it).
+	if m.help {
+		if key == "?" {
+			return m, nil
+		}
+		m.help = false
+		return m, nil
+	}
 	switch key {
 	case "q":
-		m.mon.Stop()
 		return m, tea.Quit
 	case "up", "k":
 		m.move(-1)
@@ -299,6 +318,19 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "l":
 		cmd := startFlow(&m, func(p app.Prompter) string { return app.Load(mon, p) })
 		return m, cmd
+	case "R":
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.Reresolve(mon, p, dns) })
+		return m, cmd
+	case "p":
+		if mon.Paused() {
+			mon.Resume()
+			m.message = "Probing resumed."
+		} else {
+			mon.Pause()
+			m.message = "Probing paused (in-flight probe finishes; press p to resume)."
+		}
+	case "?":
+		m.help = true
 	case "o":
 		m.sortKey = (m.sortKey + 1) % numSortKeys
 		m.refresh()
@@ -450,7 +482,8 @@ func (m Model) bottomLines() []string {
 		k := func(key, label string) string { return stKey.Render(key) + " " + label }
 		out = append(out, strings.Join([]string{
 			k("a", "add"), k("r", "remove"), k("d", "delete sel"), k("s", "save"),
-			k("l", "load"), k("o/O", "sort"), k("/", "filter"), k("↑↓", "select"), k("q", "quit"),
+			k("l", "load"), k("R", "re-resolve"), k("p", "pause"), k("o/O", "sort"),
+			k("/", "filter"), k("?", "help"), k("↑↓", "select"), k("q", "quit"),
 		}, "  "))
 	}
 	return out
@@ -557,12 +590,18 @@ func sparkline(h []time.Duration, w int) string {
 }
 
 func (m Model) View() string {
+	if m.help {
+		return m.helpView()
+	}
 	c := m.layout()
 	var lines []string
 
 	title := stTitle.Render("mincmon v"+Version) + stDim.Render(fmt.Sprintf(
 		"   probe: %s   interval %s   timeout %s   %s",
 		m.mon.ProberName(), m.mon.Interval, m.mon.Timeout, time.Now().Format("2006-01-02 15:04:05")))
+	if m.mon.Paused() {
+		title += "   " + stPending.Render("⏸ PAUSED")
+	}
 	lines = append(lines, title)
 	if m.hint != "" {
 		lines = append(lines, stMsg.Render("! "+m.hint))
@@ -671,11 +710,69 @@ func (m Model) detailLine() string {
 	d := stSel.Render(s.Addr.String())
 	if s.Domain != "" {
 		d += " " + stDomain.Render(s.Domain)
+		if s.Resolver.IsValid() {
+			d += stDim.Render(" via " + s.Resolver.String())
+		} else {
+			d += stDim.Render(" via system DNS")
+		}
 	}
 	d += " " + st.Render(s.State.String()) + stDim.Render(fmt.Sprintf(" for %s (since %s)",
 		time.Since(s.Changed).Truncate(time.Second), s.Changed.Format("15:04:05")))
 	if s.Err != "" {
 		d += stDown.Render("   error: " + s.Err)
 	}
+	// RTT statistics over the history window (successful probes only).
+	var min, max, sum time.Duration
+	cnt := 0
+	for _, h := range s.History {
+		if h < 0 {
+			continue
+		}
+		if cnt == 0 || h < min {
+			min = h
+		}
+		if cnt == 0 || h > max {
+			max = h
+		}
+		sum += h
+		cnt++
+	}
+	if cnt > 0 {
+		d += stDim.Render(fmt.Sprintf("   rtt min/avg/max: %s / %s / %s   jitter %s   sent %d",
+			fmtLatency(min), fmtLatency(sum/time.Duration(cnt)), fmtLatency(max),
+			fmtLatency(max-min), s.OK+s.Fail))
+	}
 	return d
+}
+
+// helpView is the full-screen key reference (? toggles it).
+func (m Model) helpView() string {
+	k := func(key, desc string) string {
+		return "  " + stKey.Render(pad(key, 12)) + stDim.Render(desc)
+	}
+	rows := [][2]string{
+		{"a", "add hosts (IPs, subnets with refinement, domains)"},
+		{"r", "remove hosts (blank removes the selected one)"},
+		{"d / Del", "delete the host under the cursor"},
+		{"s", "save the monitor list to a .ml.txt file (atomic)"},
+		{"l", "load a monitor list"},
+		{"R", "re-resolve selected domains (blank = all), optionally with a different resolver"},
+		{"p", "pause / resume probing (in-flight probe finishes)"},
+		{"o / O", "cycle sort column / reverse sort direction"},
+		{"/", "filter by IP, domain or state (esc clears)"},
+		{"↑/↓, j/k", "move selection"},
+		{"pgup/pgdn, space", "page up / page down"},
+		{"g / G", "jump to first / last row"},
+		{"?", "toggle this help"},
+		{"q / Ctrl+C", "quit (workers are stopped after the UI closes)"},
+	}
+	var b strings.Builder
+	b.WriteString(stTitle.Render("mincmon v"+Version) + "  " + stBold.Render("key reference"))
+	b.WriteString(strings.Repeat("\n", 2))
+	for _, r := range rows {
+		b.WriteString(k(r[0], r[1]) + "\n")
+	}
+	b.WriteString(strings.Repeat("\n", 2))
+	b.WriteString(stDim.Render("press any key to close"))
+	return b.String()
 }

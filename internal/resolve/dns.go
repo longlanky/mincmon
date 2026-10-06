@@ -24,11 +24,32 @@ const maxCNAMEChase = 8
 // With resolvers, each server is queried directly (no /etc/hosts or search
 // domains); otherwise the system resolver is used.
 func Domain(domain string, resolvers []netip.Addr, wantA, wantAAAA bool) []netip.Addr {
-	set := map[netip.Addr]bool{}
+	drs := DomainDetailed(domain, resolvers, wantA, wantAAAA)
+	out := make([]netip.Addr, 0, len(drs))
+	for _, r := range drs {
+		out = append(out, r.Addr)
+	}
+	return out
+}
+
+// Result is one resolved address plus the resolver that produced it
+// (zero = system resolver).
+type Result struct {
+	Addr     netip.Addr
+	Resolver netip.Addr
+}
+
+// DomainDetailed is like Domain but also reports, for each address, which
+// resolver returned it. When several resolvers return the same address,
+// the first one wins.
+func DomainDetailed(domain string, resolvers []netip.Addr, wantA, wantAAAA bool) []Result {
+	set := map[netip.Addr]netip.Addr{} // addr -> resolver (first wins)
 	var mu sync.Mutex
-	add := func(a netip.Addr) {
+	add := func(a netip.Addr, r netip.Addr) {
 		mu.Lock()
-		set[a] = true
+		if _, ok := set[a]; !ok {
+			set[a] = r
+		}
 		mu.Unlock()
 	}
 	if len(resolvers) > 0 {
@@ -46,7 +67,7 @@ func Domain(domain string, resolvers []netip.Addr, wantA, wantAAAA bool) []netip
 				go func(qt uint16, r netip.Addr) {
 					defer wg.Done()
 					for _, a := range query(domain, r, qt) {
-						add(a)
+						add(a, r)
 					}
 				}(qt, r)
 			}
@@ -69,17 +90,17 @@ func Domain(domain string, resolvers []netip.Addr, wantA, wantAAAA bool) []netip
 				defer cancel()
 				addrs, _ := net.DefaultResolver.LookupNetIP(ctx, n, domain)
 				for _, a := range addrs {
-					add(a.Unmap())
+					add(a.Unmap(), netip.Addr{})
 				}
 			}(n)
 		}
 		wg.Wait()
 	}
-	out := make([]netip.Addr, 0, len(set))
+	out := make([]Result, 0, len(set))
 	for a := range set {
-		out = append(out, a)
+		out = append(out, Result{Addr: a, Resolver: set[a]})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
+	sort.Slice(out, func(i, j int) bool { return out[i].Addr.Less(out[j].Addr) })
 	return out
 }
 

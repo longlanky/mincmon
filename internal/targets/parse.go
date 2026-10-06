@@ -30,10 +30,13 @@ type Entry struct {
 	Name   string       // domain name (Domain entries)
 }
 
-// Target is a monitored host and its (possibly merged) domain label.
+// Target is a monitored host, its (possibly merged) domain label, and the
+// DNS resolver that produced the entry (zero = system resolver). The
+// resolver is provenance: re-resolving the domain queries it again.
 type Target struct {
-	Addr   netip.Addr
-	Domain string
+	Addr     netip.Addr
+	Domain   string
+	Resolver netip.Addr // zero value = system resolver
 }
 
 // Classify turns one input token into a network or domain entry. Anything
@@ -302,7 +305,7 @@ func HostCount(p netip.Prefix, limit int) int {
 
 // Dedupe de-duplicates by address, keeping first-seen order. When one
 // address was resolved from several domains their labels are merged as
-// "a.com, b.com".
+// "a.com, b.com". The first recorded resolver wins (zero = system).
 func Dedupe(in []Target) []Target {
 	idx := map[netip.Addr]int{}
 	var out []Target
@@ -322,6 +325,9 @@ func Dedupe(in []Target) []Target {
 			if !HasLabel(cur, t.Domain) {
 				out[i].Domain = cur + ", " + t.Domain
 			}
+		}
+		if !out[i].Resolver.IsValid() {
+			out[i].Resolver = t.Resolver
 		}
 	}
 	return out

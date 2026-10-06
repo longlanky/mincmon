@@ -121,8 +121,7 @@ func run() int {
 	if *file != "" {
 		items, skipped, err := store.LoadWithStats(*file)
 		if err != nil {
-			prober.Close()
-			return fail("%v", err)
+			return fail("%v", err) // deferred prober.Close() runs here
 		}
 		if skipped > 0 {
 			fmt.Printf("  ! %d bad row(s) skipped in %s\n", skipped, *file)
