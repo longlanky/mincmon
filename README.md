@@ -188,7 +188,7 @@ Lines are split on the **first** comma only. If one IP was resolved from several
 
 The resolver field is provenance: re-resolving a domain (`R`, blank resolver) queries the server that originally produced it — or the system resolver when omitted. Lists saved by older versions (two fields only) load unchanged.
 
-The repo's `.gitignore` excludes `*.ml.txt`, because saved lists tend to describe private infrastructure.
+The repo's `.gitignore` excludes `*.ml.txt`, because saved lists tend to describe private infrastructure. The exception is `example.ml.txt`, a tracked starter list of public DNS resolvers — try it with `mincmon -f example.ml.txt`.
 
 ## Development
 
