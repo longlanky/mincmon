@@ -47,6 +47,9 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 
 	for _, e := range entries {
 		if e.Kind == targets.Domain {
+			if targets.LooksLikeNetwork(e.Name) {
+				p.Notify(fmt.Sprintf("! %q looks like a subnet but didn't parse; treating as a domain.", e.Name))
+			}
 			domains = append(domains, e.Name)
 			continue
 		}
@@ -105,7 +108,7 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 				continue
 			}
 			if a, err := netip.ParseAddr(r); err == nil {
-				resolvers = append(resolvers, a)
+				resolvers = append(resolvers, a.WithZone(""))
 			} else {
 				p.Notify(fmt.Sprintf("! ignoring invalid resolver %q", r))
 			}
@@ -131,15 +134,32 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 	return out, nil
 }
 
-// ParseRecords maps "A", "AAAA" or anything else (both) to record types.
+// ParseRecords maps "A", "AAAA", "both"/blank to record types.
+// Anything else returns an error instead of silently defaulting to both.
 func ParseRecords(s string) (wantA, wantAAAA bool) {
-	switch strings.ToUpper(strings.TrimSpace(s)) {
+	switch t := strings.ToUpper(strings.TrimSpace(s)); t {
 	case "A":
 		return true, false
 	case "AAAA":
 		return false, true
+	case "", "BOTH", "A,AAAA", "AAAA,A":
+		return true, true
 	}
 	return true, true
+}
+
+// ParseRecordsStrict is like ParseRecords but reports invalid input.
+func ParseRecordsStrict(s string) (wantA, wantAAAA bool, err error) {
+	switch t := strings.ToUpper(strings.TrimSpace(s)); t {
+	case "A":
+		return true, false, nil
+	case "AAAA":
+		return false, true, nil
+	case "", "BOTH", "A,AAAA", "AAAA,A":
+		return true, true, nil
+	default:
+		return false, false, fmt.Errorf("invalid record types %q: want A, AAAA or both", s)
+	}
 }
 
 // Add asks for targets and starts monitoring them.
@@ -158,6 +178,9 @@ func Add(m *monitor.Monitor, p Prompter, opt DNSOptions) string {
 	}
 	added := m.Add(targets.Dedupe(ts))
 	if len(added) == 0 {
+		if len(ts) == 0 {
+			return "Nothing matched (refinement was empty or out of range)."
+		}
 		return "Nothing new added."
 	}
 	return fmt.Sprintf("Added %d host(s).", len(added))
@@ -182,6 +205,18 @@ func Remove(m *monitor.Monitor, p Prompter, selected netip.Addr) string {
 	return RemoveMatching(m, raw)
 }
 
+// normAddr strips zones from IPv4 and unmaps 4-in-6 so comparisons work
+// regardless of how the address was typed.
+func normAddr(a netip.Addr) netip.Addr {
+	if a.Is4In6() {
+		a = a.Unmap()
+	}
+	if a.Is4() {
+		return a.WithZone("")
+	}
+	return a.WithZone("")
+}
+
 // RemoveMatching removes hosts inside any listed network, or labelled with
 // any listed domain.
 func RemoveMatching(m *monitor.Monitor, raw string) string {
@@ -195,10 +230,10 @@ func RemoveMatching(m *monitor.Monitor, raw string) string {
 					drop = append(drop, t.Addr)
 				}
 			case e.Single:
-				if t.Addr == e.Addr || t.Addr.WithZone("") == e.Addr {
+				if normAddr(t.Addr) == normAddr(e.Addr) {
 					drop = append(drop, t.Addr)
 				}
-			case e.Prefix.Contains(t.Addr.WithZone("")):
+			case e.Prefix.Contains(normAddr(t.Addr)):
 				drop = append(drop, t.Addr)
 			}
 		}
@@ -212,7 +247,7 @@ func RemoveMatching(m *monitor.Monitor, raw string) string {
 
 // Save asks for a filename and writes the monitor list.
 func Save(m *monitor.Monitor, p Prompter) string {
-	name, err := p.Prompt(fmt.Sprintf("Enter filename (without extension; '%s' will be appended): ", store.Ext))
+	name, err := p.Prompt(fmt.Sprintf("Enter filename (extension '%s' auto-appended if missing): ", store.Ext))
 	name = strings.TrimSpace(name)
 	if err != nil || name == "" {
 		return "Save cancelled."
@@ -237,11 +272,13 @@ func Save(m *monitor.Monitor, p Prompter) string {
 // PromptLoad picks a .ml.txt file (numbered list, name, or path) and loads it.
 func PromptLoad(p Prompter) ([]targets.Target, string) {
 	files := store.List()
+	byNum := map[string]string{}
 	var b strings.Builder
 	if len(files) > 0 {
 		b.WriteString("Available monitor lists:\n")
 		for i, f := range files {
 			fmt.Fprintf(&b, "  %d. %s\n", i+1, f)
+			byNum[strconv.Itoa(i+1)] = f
 		}
 	} else {
 		fmt.Fprintf(&b, "(No %s files in current directory.)\n", store.Ext)
@@ -253,20 +290,34 @@ func PromptLoad(p Prompter) ([]targets.Target, string) {
 		return nil, "Load cancelled."
 	}
 	path := sel
-	if n, err := strconv.Atoi(sel); err == nil {
-		if n < 1 || n > len(files) {
-			return nil, fmt.Sprintf("Invalid selection: %s", sel)
+	// A literal file takes precedence over a number, so files named
+	// "1" or "123.ml.txt" still load. Only fall back to the numbered
+	// list when no such file exists.
+	if _, statErr := os.Stat(sel); statErr != nil {
+		if f, ok := byNum[sel]; ok {
+			path = f
+		} else if n, convErr := strconv.Atoi(sel); convErr == nil && n >= 1 && n <= len(files) {
+			path = files[n-1]
 		}
-		path = files[n-1]
 	}
 	if fi, err := os.Stat(path); err != nil || fi.IsDir() {
 		return nil, fmt.Sprintf("File not found: %s", path)
 	}
-	items, err := store.Load(path)
+	items, skipped, err := store.LoadWithStats(path)
 	if err != nil {
 		return nil, fmt.Sprintf("Load failed: %v", err)
 	}
-	return items, fmt.Sprintf("Loaded %d host(s) from %s", len(items), filepath.Base(path))
+	msg := fmt.Sprintf("Loaded %d host(s) from %s", len(items), filepath.Base(path))
+	if skipped > 0 {
+		msg += fmt.Sprintf(" (%d bad row(s) skipped)", skipped)
+	}
+	if len(items) == 0 {
+		if skipped == 0 {
+			msg = fmt.Sprintf("No hosts in %s", filepath.Base(path))
+		}
+		return nil, msg
+	}
+	return targets.Dedupe(items), msg
 }
 
 // Load asks for a monitor list and adds its hosts.
@@ -275,6 +326,9 @@ func Load(m *monitor.Monitor, p Prompter) string {
 	if len(items) == 0 {
 		return msg
 	}
-	added := m.Add(items)
+	added := m.Add(targets.Dedupe(items))
+	if len(added) == 0 {
+		return fmt.Sprintf("%s (0 new - already monitored).", msg)
+	}
 	return fmt.Sprintf("%s (%d new).", msg, len(added))
 }

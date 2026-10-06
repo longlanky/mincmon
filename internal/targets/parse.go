@@ -178,7 +178,11 @@ func ParseRefine(text string, v6 bool, cap int) (offsets []Offset, refined bool,
 			// Check the span BEFORE expanding: a range like 0-ffffffff would
 			// otherwise allocate billions of offsets.
 			span := hi.sub(lo)
-			if span.cmp(Offset{0, uint64(cap - len(offsets))}) >= 0 {
+			remaining := cap - len(offsets)
+			if remaining < 0 {
+				return nil, true, tooMany
+			}
+			if span.cmp(Offset{0, uint64(remaining)}) >= 0 {
 				return nil, true, tooMany
 			}
 			for o := lo; ; o, _ = o.add(Offset{0, 1}) {
@@ -204,7 +208,8 @@ func ParseRefine(text string, v6 bool, cap int) (offsets []Offset, refined bool,
 // Expand returns the hosts to monitor for a network entry. Without a
 // refinement it yields the usable hosts (as Python's ipaddress hosts());
 // with one it yields base+offset for each offset inside the prefix.
-// Truncation to cap is reported through warn.
+// Truncation to cap, out-of-range offsets, and empty results are reported
+// through warn.
 func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string)) []netip.Addr {
 	if e.Single {
 		return []netip.Addr{e.Addr}
@@ -214,6 +219,7 @@ func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string))
 	var out []netip.Addr
 
 	if refined {
+		skipped := 0
 		for _, off := range offsets {
 			if len(out) >= cap {
 				warn(fmt.Sprintf("! Refinement for %s truncated to %d hosts.", p, cap))
@@ -221,23 +227,38 @@ func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string))
 			}
 			v, over := base.add(off)
 			if over {
+				skipped++
 				continue
 			}
 			a, ok := u128ToAddr(v, p.Addr())
 			if ok && p.Contains(a) {
 				out = append(out, a)
+			} else {
+				skipped++
 			}
+		}
+		if skipped > 0 {
+			warn(fmt.Sprintf("! %d refined offset(s) outside %s skipped.", skipped, p))
+		}
+		if len(out) == 0 {
+			warn(fmt.Sprintf("! Refinement for %s matched no hosts.", p))
 		}
 		return out
 	}
 
 	hostBits := p.Addr().BitLen() - p.Bits()
 	last := base
-	if hostBits >= 64 {
+	switch {
+	case hostBits >= 128:
+		last.hi = ^uint64(0)
 		last.lo = ^uint64(0)
-		last.hi |= (1 << (hostBits - 64)) - 1 // 1<<64 wraps to 0 → all ones
-	} else {
-		last.lo |= (1 << hostBits) - 1
+	case hostBits == 64:
+		last.lo = ^uint64(0)
+	case hostBits > 64:
+		last.lo = ^uint64(0)
+		last.hi |= (uint64(1) << uint(hostBits-64)) - 1
+	case hostBits > 0:
+		last.lo |= (uint64(1) << uint(hostBits)) - 1
 	}
 	start, end := base, last
 	if p.Addr().Is4() && hostBits > 1 {
@@ -265,10 +286,18 @@ func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string))
 // HostCount returns min(number of addresses in p, limit).
 func HostCount(p netip.Prefix, limit int) int {
 	hostBits := p.Addr().BitLen() - p.Bits()
-	if hostBits >= 31 || 1<<hostBits > limit {
+	if hostBits < 0 {
+		return 0
+	}
+	if hostBits >= 31 {
 		return limit
 	}
-	return 1 << hostBits
+	// hostBits < 31 here, so 1<<hostBits fits even 32-bit ints.
+	if n := 1 << uint(hostBits); n > limit {
+		return limit
+	} else {
+		return n
+	}
 }
 
 // Dedupe de-duplicates by address, keeping first-seen order. When one
@@ -299,11 +328,34 @@ func Dedupe(in []Target) []Target {
 }
 
 // HasLabel reports whether a (possibly merged) domain label contains name.
+// Labels are comma-separated; surrounding spaces are ignored so hand-edited
+// lists like "a.com,b.com" still match.
 func HasLabel(label, name string) bool {
-	for _, l := range strings.Split(label, ", ") {
-		if l == name {
+	name = strings.TrimSpace(name)
+	for _, l := range strings.Split(label, ",") {
+		if strings.TrimSpace(l) == name {
 			return true
 		}
+	}
+	return false
+}
+
+// LooksLikeNetwork reports whether s was probably meant as a subnet but
+// failed to parse (e.g. "10.0.0.0/33" or "10.0.0.0/255.0.255.0"). Callers
+// use it to warn instead of silently treating the typo as a domain.
+func LooksLikeNetwork(s string) bool {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, "/") {
+		return false
+	}
+	if _, ok := parsePrefix(s); ok {
+		return false
+	}
+	addrS, _, _ := strings.Cut(s, "/")
+	// Contains a parseable IP on the left, or dotted netmask on the right:
+	// almost certainly a CIDR typo, not a domain.
+	if _, err := netip.ParseAddr(strings.TrimSpace(addrS)); err == nil {
+		return true
 	}
 	return false
 }

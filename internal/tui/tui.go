@@ -19,7 +19,7 @@ import (
 )
 
 // Version is shown in the title bar.
-const Version = "4.0"
+const Version = "1.1.0"
 
 var (
 	stTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
@@ -131,9 +131,12 @@ func tick() tea.Cmd {
 
 func (m Model) Init() tea.Cmd { return tick() }
 
-// run starts an app flow in the background; its prompts arrive as
-// promptReq messages and its result as actionDone.
-func (m *Model) run(f func(app.Prompter) string) tea.Cmd {
+// startFlow marks the model busy and returns the command that runs an app
+// flow in the background; its prompts arrive as promptReq messages and its
+// result as actionDone. It is a free function (not a method mutating m) so
+// callers can't hit the value/pointer evaluation-order bug where
+// "return m, m.run(...)" copies m before busy=true takes effect.
+func startFlow(m *Model, f func(app.Prompter) string) tea.Cmd {
 	m.busy = true
 	m.notes = nil
 	m.message = ""
@@ -154,7 +157,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tick()
 
 	case promptReq:
-		m.prompt = &msg
+		if m.prompt != nil {
+			// A flow is already prompting (shouldn't happen now that
+			// busy blocks concurrent flows); don't leak the old channel.
+			// Answer the duplicate with cancel so its goroutine exits.
+			msg.reply <- promptResp{err: app.ErrCancelled}
+			return m, nil
+		}
+		// Copy: msg is a loop variable; taking &msg directly aliases it.
+		req := msg
+		m.prompt = &req
 		m.input.SetValue("")
 		return m, m.input.Focus()
 
@@ -240,7 +252,7 @@ func (m Model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	switch key {
-	case "q", "e":
+	case "q":
 		m.mon.Stop()
 		return m, tea.Quit
 	case "up", "k":
@@ -270,19 +282,23 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	mon, dns := m.mon, m.dns
 	switch key {
 	case "a":
-		return m, m.run(func(p app.Prompter) string { return app.Add(mon, p, dns) })
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.Add(mon, p, dns) })
+		return m, cmd
 	case "r":
 		sel := m.selAddr
-		return m, m.run(func(p app.Prompter) string { return app.Remove(mon, p, sel) })
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.Remove(mon, p, sel) })
+		return m, cmd
 	case "d", "delete":
 		if m.selAddr.IsValid() {
 			m.message = app.RemoveMatching(mon, m.selAddr.String())
 			m.refresh()
 		}
 	case "s":
-		return m, m.run(func(p app.Prompter) string { return app.Save(mon, p) })
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.Save(mon, p) })
+		return m, cmd
 	case "l":
-		return m, m.run(func(p app.Prompter) string { return app.Load(mon, p) })
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.Load(mon, p) })
+		return m, cmd
 	case "o":
 		m.sortKey = (m.sortKey + 1) % numSortKeys
 		m.refresh()
@@ -309,7 +325,7 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) refresh() {
 	m.all = m.mon.Snapshot()
 	f := strings.ToLower(m.filter)
-	rows := m.rows[:0]
+	rows := make([]monitor.Status, 0, len(m.all))
 	for _, s := range m.all {
 		if f == "" || strings.Contains(s.Addr.String(), f) ||
 			strings.Contains(strings.ToLower(s.Domain), f) ||
@@ -364,7 +380,7 @@ func (m *Model) lessFunc() func(a, b monitor.Status) bool {
 		}
 		return func(a, b monitor.Status) bool { return lat(a) < lat(b) }
 	case sortLoss:
-		return func(a, b monitor.Status) bool { return a.Loss() > b.Loss() }
+		return func(a, b monitor.Status) bool { return a.Loss() < b.Loss() }
 	}
 	return func(a, b monitor.Status) bool { return false }
 }

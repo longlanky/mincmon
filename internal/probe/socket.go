@@ -30,7 +30,7 @@ type sockProber struct {
 }
 
 type pendingKey struct {
-	addr netip.Addr // zone stripped
+	addr netip.Addr // zone-sensitive: fe80::1%eth0 != fe80::1%eth1
 	seq  uint16
 }
 
@@ -89,7 +89,7 @@ func (p *sockProber) Probe(ctx context.Context, addr netip.Addr, timeout time.Du
 		dst = &net.UDPAddr{IP: addr.AsSlice(), Zone: addr.Zone()}
 	}
 
-	key := pendingKey{addr.WithZone(""), seq}
+	key := pendingKey{addr, seq}
 	ch := make(chan time.Time, 1)
 	p.mu.Lock()
 	p.pending[key] = ch
@@ -165,13 +165,35 @@ func (p *sockProber) receive() {
 		if !p.v6 {
 			src = src.Unmap()
 		}
-		key := pendingKey{src, uint16(echo.Seq)}
+		seq := uint16(echo.Seq)
 		p.mu.Lock()
-		ch := p.pending[key]
-		delete(p.pending, key)
+		// Fast path: exact match (covers zoneless addrs).
+		var ch chan time.Time
+		var hit pendingKey
+		if c, ok := p.pending[pendingKey{src, seq}]; ok {
+			ch, hit = c, pendingKey{src, seq}
+		} else {
+			// Link-local replies carry no zone; match the single
+			// pending entry with the same stripped addr+seq so
+			// fe80::1%eth0 and %eth1 don't cross-talk when both
+			// are in flight with different seqs, and a lone
+			// zoned probe still gets its reply.
+			for k, c := range p.pending {
+				if k.seq == seq && k.addr.WithZone("") == src {
+					ch, hit = c, k
+					break
+				}
+			}
+		}
+		if ch != nil {
+			delete(p.pending, hit)
+		}
 		p.mu.Unlock()
 		if ch != nil {
-			ch <- now
+			select {
+			case ch <- now:
+			default:
+			}
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +73,7 @@ type Monitor struct {
 	spawnSeq int
 	ctx      context.Context
 	stop     context.CancelFunc
+	wg       sync.WaitGroup
 }
 
 func New(p probe.Prober, interval, timeout time.Duration) *Monitor {
@@ -83,16 +85,19 @@ func New(p probe.Prober, interval, timeout time.Duration) *Monitor {
 }
 
 // Add starts monitoring new targets and returns the newly added addresses.
-// For hosts already monitored, a domain label is filled in if it had none.
+// For hosts already monitored, domain labels are merged like targets.Dedupe.
 func (m *Monitor) Add(items []targets.Target) []netip.Addr {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	type spawn struct {
+		ctx   context.Context
+		addr  netip.Addr
+		delay time.Duration
+	}
+	var toSpawn []spawn
 	var added []netip.Addr
 	for _, t := range items {
 		if h, ok := m.hosts[t.Addr]; ok {
-			if h.Domain == "" {
-				h.Domain = t.Domain
-			}
+			mergeLabel(&h.Domain, t.Domain)
 			continue
 		}
 		ctx, cancel := context.WithCancel(m.ctx)
@@ -103,9 +108,48 @@ func (m *Monitor) Add(items []targets.Target) []netip.Addr {
 		// Stagger start times so large lists don't burst all at once
 		delay := time.Duration(m.spawnSeq%40) * m.Interval / 40
 		m.spawnSeq++
-		go m.worker(ctx, t.Addr, delay)
+		toSpawn = append(toSpawn, spawn{ctx, t.Addr, delay})
+	}
+	m.mu.Unlock()
+	for _, sp := range toSpawn {
+		m.wg.Add(1)
+		go m.worker(sp.ctx, sp.addr, sp.delay)
 	}
 	return added
+}
+
+func mergeLabel(cur *string, add string) {
+	if add == "" || add == *cur {
+		return
+	}
+	if *cur == "" {
+		*cur = add
+		return
+	}
+	// add may itself be merged; merge piece-wise to avoid duplicates
+	// and to tolerate both ", " and "," separators.
+	for _, part := range splitLabels(add) {
+		found := false
+		for _, existing := range splitLabels(*cur) {
+			if existing == part {
+				found = true
+				break
+			}
+		}
+		if !found {
+			*cur = *cur + ", " + part
+		}
+	}
+}
+
+func splitLabels(label string) []string {
+	var out []string
+	for _, p := range strings.Split(label, ",") {
+		if q := strings.TrimSpace(p); q != "" {
+			out = append(out, q)
+		}
+	}
+	return out
 }
 
 // Remove stops monitoring the given addresses and returns those removed.
@@ -123,7 +167,7 @@ func (m *Monitor) Remove(addrs []netip.Addr) []netip.Addr {
 		}
 	}
 	if len(drop) > 0 {
-		kept := m.order[:0]
+		kept := make([]netip.Addr, 0, len(m.order)-len(drop))
 		for _, a := range m.order {
 			if !drop[a] {
 				kept = append(kept, a)
@@ -160,20 +204,33 @@ func (m *Monitor) Targets() []targets.Target {
 
 func (m *Monitor) ProberName() string { return m.prober.Name() }
 
-// Stop cancels every worker.
-func (m *Monitor) Stop() { m.stop() }
+// Stop cancels every worker and waits for them to exit.
+func (m *Monitor) Stop() {
+	m.stop()
+	m.wg.Wait()
+}
+
+// Wait blocks until all workers have exited (after Stop).
+func (m *Monitor) Wait() { m.wg.Wait() }
 
 func (m *Monitor) worker(ctx context.Context, addr netip.Addr, delay time.Duration) {
+	defer m.wg.Done()
 	if !sleep(ctx, delay) {
 		return
 	}
+	// Probe immediately after the stagger delay, then on a steady ticker
+	// so the effective period stays Interval instead of Interval+probe_time.
+	t := time.NewTicker(m.Interval)
+	defer t.Stop()
 	for {
 		rtt, err := m.prober.Probe(ctx, addr, m.Timeout)
 		if ctx.Err() != nil {
 			return
 		}
 		m.record(addr, rtt, err)
-		if !sleep(ctx, m.Interval) {
+		select {
+		case <-t.C:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -207,7 +264,11 @@ func (m *Monitor) record(addr netip.Addr, rtt time.Duration, err error) {
 	}
 	h.History = append(h.History, rtt)
 	if len(h.History) > HistoryLen {
-		h.History = h.History[len(h.History)-HistoryLen:]
+		// Copy so the backing array stays capped at HistoryLen instead of
+		// growing and being retained by the reslice.
+		cp := make([]time.Duration, HistoryLen)
+		copy(cp, h.History[len(h.History)-HistoryLen:])
+		h.History = cp
 	}
 }
 

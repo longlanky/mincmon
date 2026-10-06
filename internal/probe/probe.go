@@ -105,12 +105,15 @@ func (d *dual) Name() string {
 }
 
 func (d *dual) Close() error {
+	var errs []error
 	for _, p := range []Prober{d.v4, d.v6} {
 		if p != nil {
-			p.Close()
+			if err := p.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // payload is the echo request body.

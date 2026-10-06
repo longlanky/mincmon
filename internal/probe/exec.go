@@ -17,6 +17,12 @@ const execName = "ping binary"
 
 // execProber shells out to the system ping, one process per probe. It is
 // the last-resort fallback when no ICMP socket can be opened.
+//
+// A shared semaphore caps concurrent ping processes so a 1000-host list
+// can't fork-bomb the machine when every host is probed every interval.
+var execSem = make(chan struct{}, 32)
+
+// execProber shells out to the system ping, one process per probe.
 type execProber struct {
 	v6   bool
 	bin  string
@@ -66,14 +72,32 @@ func newExec(v6 bool) (Prober, error) {
 func (p *execProber) Name() string { return execName }
 func (p *execProber) Close() error { return nil }
 
+// stripForExec normalises 4-in-6 to plain IPv4 but keeps the IPv6 zone
+// (fe80::1%eth0) which ping needs to pick an interface.
+func stripForExec(a netip.Addr) netip.Addr {
+	if a.Is4In6() {
+		return a.Unmap()
+	}
+	if a.Is4() {
+		return a.WithZone("")
+	}
+	return a
+}
+
 // Unix: "time=22.5 ms"; Windows: "time=22ms" / "time<1ms". Localized output
 // won't match, in which case wall-clock time is used.
 var latencyRE = regexp.MustCompile(`(?i)time\s*[=<]\s*([0-9]+(?:\.[0-9]+)?)\s*ms`)
 
 func (p *execProber) Probe(ctx context.Context, addr netip.Addr, timeout time.Duration) (time.Duration, error) {
+	select {
+	case execSem <- struct{}{}:
+		defer func() { <-execSem }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout+time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p.bin, p.args(addr, timeout)...)
+	cmd := exec.CommandContext(ctx, p.bin, p.args(stripForExec(addr), timeout)...)
 	start := time.Now()
 	out, err := cmd.Output()
 	elapsed := time.Since(start)

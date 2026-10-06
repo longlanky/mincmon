@@ -7,7 +7,7 @@
 Give it IP addresses, subnets, or domain names. mincmon pings every host continuously and shows a live table of status, latency, packet loss, and a recent-latency history graph per host. It ships as one static binary with no runtime dependencies, for Linux, Windows, and macOS.
 
 ```
-mincmon v4.0   probe: ICMP socket   interval 2s   timeout 1s   2026-10-05 15:09:22
+mincmon v1.1.0   probe: ICMP socket   interval 2s   timeout 1s   2026-10-05 15:09:22
 
   STATUS   IP ADDRESS            DOMAIN                LATENCY   LOSS     UP   DOWN  HISTORY
 ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ Run with no arguments to be asked interactively. Type the targets, or `load` to 
 
 ```
 $ mincmon
-mincmon v4.0  (probe: ICMP socket)
+mincmon v1.1.0  (probe: ICMP socket)
 
 Input IP addresses, subnets, and/or domains to monitor, or enter 'load' to load an existing save:
 > 192.0.2.10, 10.0.0.0/24, example.com
@@ -156,7 +156,7 @@ Any single subnet or refinement is capped at 1024 hosts.
 | `l` | Load a `.ml.txt` file from the current directory, or by path. |
 | `o` / `O` | Cycle the sort column (added, IP, domain, state, latency, loss) / reverse it. |
 | `/` | Filter by IP, domain, or state. `Esc` clears the filter. |
-| `q` / `e` / `Ctrl+C` | Quit. |
+| `q` / `Ctrl+C` | Quit. |
 
 In a prompt, `Enter` submits and `Esc` cancels.
 
