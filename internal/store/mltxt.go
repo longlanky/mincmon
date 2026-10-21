@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package store reads and writes .ml.txt monitor lists: one "ip,domain"
 // row per host, domain blank if none.
 package store

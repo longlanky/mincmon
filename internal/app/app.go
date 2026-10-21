@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package app holds the interactive flows (add, remove, save, load) shared
 // by the startup prompts and the TUI. Each flow talks to the user only
 // through a Prompter.

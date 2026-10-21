@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package tui is the live Bubble Tea interface: a scrollable, sortable,
 // filterable host table with per-host RTT sparklines.
 package tui

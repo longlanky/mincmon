@@ -58,6 +58,8 @@ dist/mincmon-linux-arm64
 
 `build.sh` always sets the amd64 level explicitly (default v1). Some Go toolchains default to the build machine's own level, and their binaries won't start on older CPUs.
 
+Each build also writes `dist/LICENSE` and `dist/THIRD_PARTY_NOTICES.txt`, which holds the licenses of the Go runtime and every bundled dependency. Ship both alongside the binaries in a release.
+
 Copy the one you need anywhere on your `PATH`. To run straight from the source tree instead, use `go run ./cmd/mincmon`.
 
 ### Permissions (Linux)
@@ -212,3 +214,15 @@ go vet ./... && GOOS=windows go vet ./... && GOOS=darwin go vet ./...
 
 - **Windows:** the Windows ICMP API backend builds and passes vet, but it has not been run on real Windows yet. Reports welcome.
 - **macOS:** builds only; it has not been run on a Mac yet.
+
+## License
+
+Copyright (C) 2026 LongLanky
+
+mincmon is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License](LICENSE) as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+In short, you may use, study, modify, and share mincmon. If you distribute it, modified or not, you must do so under the same license and make the source code available. This applies to every release, including binaries.
+
+mincmon is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for details.
+
+Release binaries bundle third-party libraries under the MIT and BSD licenses. Their notices are in `THIRD_PARTY_NOTICES.txt` next to each release's binaries.

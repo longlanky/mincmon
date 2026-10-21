@@ -37,5 +37,6 @@ Flags: `-f list.ml.txt`, `-i 2s`, `-t 1s`, `--resolver IPs|system`, `--records A
 ## Constraints
 
 - Windows support is maintained: `native_windows.go` (ICMP API) and the Windows branch in `exec.go`. Keep both paths, and vet with `GOOS=windows`. The Windows ICMPv6 reply offsets (Status at 28, RTT at 32) were not tested on real Windows.
+- Licensed GPL-3.0-or-later (copyright LongLanky). Every new source file (`.go`, scripts) starts with `// Copyright (C) 2026 LongLanky` + `// SPDX-License-Identifier: GPL-3.0-or-later`, then a blank line (so it isn't mistaken for a package doc comment). New dependencies must be GPLv3-compatible (MIT/BSD/Apache-2.0 are fine). `build.sh` generates `dist/THIRD_PARTY_NOTICES.txt` from the modules actually linked and fails if one has no license information.
 - Release binaries must stay `CGO_ENABLED=0` (static, no libc) so they run on EL8 and older distros.
 - `build.sh` must keep pinning `GOAMD64` (default v1) and `GOARM64`. This machine's Gentoo Go toolchain defaults to `GOAMD64=v3`, so unpinned binaries crash on older CPUs. Verify with `go version -m <binary>` or `qemu-x86_64 -cpu qemu64 <binary> -version`.

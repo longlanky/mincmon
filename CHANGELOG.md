@@ -1,5 +1,12 @@
 # ✨ mincmon Changelog
 
+## Unreleased
+
+### 📜 Licensing
+
+* ⚖️ **mincmon is now licensed under the GNU GPL v3 or later.** Every source file carries a copyright and SPDX license header, and `mincmon -version` prints the copyright and license notice. Impact: you're free to use, modify and share mincmon, and anyone who redistributes it must keep it open under the same terms. 🔓
+* 📦 **Release bundles include license notices.** `build.sh` now writes `LICENSE` and `THIRD_PARTY_NOTICES.txt` into `dist/`. The notices cover the Go runtime and every bundled third-party library, generated from what is actually linked into the binaries. 🧾
+
 ## v1.2.0 — Pause, re-resolve & richer host insight 📊
 *Minor bump: new user-facing features plus a few small fixes. No breaking changes — `.ml.txt` lists, flags and keys you already use behave exactly as before.*
 

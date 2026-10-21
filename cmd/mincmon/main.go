@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Command mincmon is a network ping monitor with a live terminal UI.
 package main
 
@@ -56,6 +59,10 @@ func run() int {
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("mincmon", tui.Version)
+		fmt.Println("Copyright (C) 2026 LongLanky")
+		fmt.Println("License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.")
+		fmt.Println("This is free software: you are free to change and redistribute it.")
+		fmt.Println("There is NO WARRANTY, to the extent permitted by law.")
 		return 0
 	}
 	// stdlib flag stops at the first positional: "mincmon 10.0.0.1 -i 1s"

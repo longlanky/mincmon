@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package resolve looks up A/AAAA records via user-specified DNS servers
 // or the system resolver.
 package resolve

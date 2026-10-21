@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package monitor runs one goroutine per target, probing it on an
 // interval and recording state in a shared, insertion-ordered table.
 package monitor

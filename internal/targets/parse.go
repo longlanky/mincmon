@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package targets classifies user input (IPs, subnets, domains), expands
 // subnets into host lists, and de-duplicates resolved targets.
 package targets

@@ -1,3 +1,6 @@
+// Copyright (C) 2026 LongLanky
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package probe sends ICMP echo requests. Backends, in preference order:
 // unprivileged ICMP datagram sockets (Linux/macOS), the Windows ICMP API,
 // raw ICMP sockets (root / CAP_NET_RAW), and finally the system ping
