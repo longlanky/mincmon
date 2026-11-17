@@ -22,7 +22,7 @@ import (
 )
 
 // Version is shown in the title bar.
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 var (
 	stTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
@@ -84,19 +84,63 @@ const (
 
 var sortNames = [...]string{"added", "ip", "domain", "state", "latency", "loss"}
 
+// viewMode selects which list the main pane shows. Tab cycles them in
+// the order all → up → down → deltas.
+type viewMode int
+
+const (
+	viewAll viewMode = iota
+	viewUp
+	viewDown
+	viewDeltas
+	numViews
+)
+
+var viewNames = [...]string{"all", "up", "down", "deltas"}
+
+// deltaRow is one line of the deltas view: a feed event, a subnet
+// cluster header, or a host (inside an expanded cluster, or flat).
+type rowKind int
+
+const (
+	rowEvent rowKind = iota
+	rowCluster
+	rowHost
+	rowFlat
+)
+
+type deltaRow struct {
+	kind   rowKind
+	ev     monitor.Event
+	origin string
+	status monitor.Status
+	up     int
+	down   int
+	pend   int
+	flap   int
+}
+
 type Model struct {
 	mon      *monitor.Monitor
 	prompter *prompter
 	dns      app.DNSOptions
+	sess     *app.Session
 	hint     string
 
-	all      []monitor.Status // latest snapshot
-	rows     []monitor.Status // filtered + sorted view
-	cursor   int
-	offset   int
-	selAddr  netip.Addr
-	sortKey  sortKey
-	sortDesc bool
+	view      viewMode
+	all       []monitor.Status // latest snapshot
+	rows      []monitor.Status // filtered + sorted table view
+	drows     []deltaRow       // deltas view lines
+	events    []monitor.Event  // newest first
+	dropped   int
+	latestSeq uint64
+	seenSeq   uint64
+	expanded  map[string]bool
+	cursor    int
+	offset    int
+	selAddr   netip.Addr
+	sortKey   sortKey
+	sortDesc  bool
 
 	filter      string
 	filtering   bool
@@ -113,14 +157,18 @@ type Model struct {
 }
 
 // Run starts the TUI and blocks until the user quits.
-func Run(mon *monitor.Monitor, dns app.DNSOptions, hint string) error {
+func Run(mon *monitor.Monitor, dns app.DNSOptions, sess *app.Session, hint string) error {
 	in := textinput.New()
 	in.Prompt = "> "
 	fi := textinput.New()
 	fi.Prompt = "/"
+	if sess == nil {
+		sess = &app.Session{}
+	}
 	m := Model{
-		mon: mon, prompter: &prompter{}, dns: dns, hint: hint,
+		mon: mon, prompter: &prompter{}, dns: dns, sess: sess, hint: hint,
 		input: in, filterInput: fi, width: 100, height: 30,
+		expanded: map[string]bool{},
 	}
 	m.refresh()
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -277,6 +325,22 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q":
 		return m, tea.Quit
+	case "tab":
+		m.view = (m.view + 1) % numViews
+		m.cursor, m.offset = 0, 0
+		m.refresh()
+		return m, nil
+	case "shift+tab":
+		m.view = (m.view + numViews - 1) % numViews
+		m.cursor, m.offset = 0, 0
+		m.refresh()
+		return m, nil
+	case "enter":
+		if m.view == viewDeltas {
+			m.enterDelta()
+			return m, nil
+		}
+		return m, nil
 	case "up", "k":
 		m.move(-1)
 		return m, nil
@@ -290,10 +354,10 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.move(m.tableRows())
 		return m, nil
 	case "home", "g":
-		m.move(-len(m.rows))
+		m.move(-m.curLen())
 		return m, nil
 	case "end", "G":
-		m.move(len(m.rows))
+		m.move(m.curLen())
 		return m, nil
 	}
 
@@ -301,10 +365,16 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.busy {
 		return m, nil
 	}
-	mon, dns := m.mon, m.dns
+	mon, dns, sess := m.mon, m.dns, m.sess
 	switch key {
 	case "a":
-		cmd := startFlow(&m, func(p app.Prompter) string { return app.Add(mon, p, dns) })
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.Add(mon, p, dns, sess) })
+		return m, cmd
+	case "c":
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.ChangeConfirm(mon, p) })
+		return m, cmd
+	case "S":
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.SaveReport(mon, p) })
 		return m, cmd
 	case "r":
 		sel := m.selAddr
@@ -323,6 +393,14 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case "R":
 		cmd := startFlow(&m, func(p app.Prompter) string { return app.Reresolve(mon, p, dns) })
+		return m, cmd
+	case "n":
+		if !m.selAddr.IsValid() {
+			m.message = "No host selected."
+			return m, nil
+		}
+		sel := m.selAddr
+		cmd := startFlow(&m, func(p app.Prompter) string { return app.ResolvePTR(mon, p, dns, sel) })
 		return m, cmd
 	case "p":
 		if mon.Paused() {
@@ -357,11 +435,50 @@ func (m Model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 //  View state: snapshot, filter, sort, selection
 // ---------------------------------------------------------------------
 
+// enterDelta applies Enter in the deltas view: a cluster header toggles
+// expanded/collapsed; a feed event jumps to its host in the All view.
+func (m *Model) enterDelta() {
+	if m.cursor < 0 || m.cursor >= len(m.drows) {
+		return
+	}
+	r := m.drows[m.cursor]
+	switch r.kind {
+	case rowCluster:
+		if m.expanded == nil {
+			m.expanded = map[string]bool{}
+		}
+		m.expanded[r.origin] = !m.expanded[r.origin]
+		m.refresh()
+	case rowEvent:
+		m.selAddr = r.ev.Addr
+		m.view = viewAll
+		m.cursor, m.offset = 0, 0
+		m.refresh()
+	}
+}
+
 func (m *Model) refresh() {
 	m.all = m.mon.Snapshot()
+	m.events, m.dropped, m.latestSeq = m.mon.Events()
+	if m.view == viewDeltas {
+		m.seenSeq = m.latestSeq // viewing the feed marks events seen
+		m.buildDeltas()
+	}
 	f := strings.ToLower(m.filter)
+	stateOK := func(s monitor.Status) bool {
+		switch m.view {
+		case viewUp:
+			return s.State == monitor.Up
+		case viewDown:
+			return s.State == monitor.Down
+		}
+		return true
+	}
 	rows := make([]monitor.Status, 0, len(m.all))
 	for _, s := range m.all {
+		if !stateOK(s) {
+			continue
+		}
 		if f == "" || strings.Contains(s.Addr.String(), f) ||
 			strings.Contains(strings.ToLower(s.Domain), f) ||
 			strings.Contains(strings.ToLower(s.State.String()), f) {
@@ -382,14 +499,79 @@ func (m *Model) refresh() {
 			m.rows[i], m.rows[j] = m.rows[j], m.rows[i]
 		}
 	}
-	// Keep the same host selected across re-sorts and removals
-	for i, s := range m.rows {
-		if s.Addr == m.selAddr {
-			m.cursor = i
-			break
+	// Keep the same host selected across re-sorts and removals (table
+	// views only; the deltas cursor addresses feed/cluster lines).
+	if m.view != viewDeltas {
+		for i, s := range m.rows {
+			if s.Addr == m.selAddr {
+				m.cursor = i
+				break
+			}
 		}
 	}
 	m.clamp()
+}
+
+// buildDeltas rebuilds the deltas line list: feed events (newest first),
+// then one collapsed cluster per origin in first-seen order (expanded
+// clusters inline their hosts, sorted by IP), then origin-less hosts.
+func (m *Model) buildDeltas() {
+	f := strings.ToLower(m.filter)
+	match := func(s string) bool { return f == "" || strings.Contains(strings.ToLower(s), f) }
+	var rows []deltaRow
+	for _, e := range m.events {
+		if match(e.Addr.String()) || match(e.Domain) || match(e.Origin) ||
+			match(e.From.String()) || match(e.To.String()) {
+			rows = append(rows, deltaRow{kind: rowEvent, ev: e})
+		}
+	}
+	var origins []string
+	byOrigin := map[string][]monitor.Status{}
+	var flat []monitor.Status
+	for _, s := range m.all {
+		if s.Origin == "" {
+			flat = append(flat, s)
+			continue
+		}
+		if _, ok := byOrigin[s.Origin]; !ok {
+			origins = append(origins, s.Origin)
+		}
+		byOrigin[s.Origin] = append(byOrigin[s.Origin], s)
+	}
+	for _, o := range origins {
+		hosts := byOrigin[o]
+		cr := deltaRow{kind: rowCluster, origin: o}
+		for _, s := range hosts {
+			switch s.State {
+			case monitor.Up:
+				cr.up++
+			case monitor.Down:
+				cr.down++
+			default:
+				cr.pend++
+			}
+			if s.Flap != monitor.FlapNone {
+				cr.flap++
+			}
+		}
+		if match(o) || f == "" {
+			rows = append(rows, cr)
+		}
+		if m.expanded[o] {
+			sort.SliceStable(hosts, func(i, j int) bool { return hosts[i].Addr.Less(hosts[j].Addr) })
+			for _, s := range hosts {
+				if match(s.Addr.String()) || match(s.Domain) {
+					rows = append(rows, deltaRow{kind: rowHost, origin: o, status: s})
+				}
+			}
+		}
+	}
+	for _, s := range flat {
+		if match(s.Addr.String()) || match(s.Domain) {
+			rows = append(rows, deltaRow{kind: rowFlat, status: s})
+		}
+	}
+	m.drows = rows
 }
 
 func (m *Model) lessFunc() func(a, b monitor.Status) bool {
@@ -420,6 +602,13 @@ func (m *Model) lessFunc() func(a, b monitor.Status) bool {
 	return func(a, b monitor.Status) bool { return false }
 }
 
+func (m *Model) curLen() int {
+	if m.view == viewDeltas {
+		return len(m.drows)
+	}
+	return len(m.rows)
+}
+
 func (m *Model) move(delta int) {
 	m.cursor += delta
 	m.clamp()
@@ -427,6 +616,9 @@ func (m *Model) move(delta int) {
 
 func (m *Model) clamp() {
 	n := len(m.rows)
+	if m.view == viewDeltas {
+		n = len(m.drows)
+	}
 	if m.cursor >= n {
 		m.cursor = n - 1
 	}
@@ -435,6 +627,18 @@ func (m *Model) clamp() {
 	}
 	if n == 0 {
 		m.selAddr = netip.Addr{}
+	} else if m.view == viewDeltas {
+		// Delete/detail act on the host under the cursor when the line
+		// names one; a cluster header names none.
+		r := m.drows[m.cursor]
+		switch r.kind {
+		case rowEvent:
+			m.selAddr = r.ev.Addr
+		case rowHost, rowFlat:
+			m.selAddr = r.status.Addr
+		default:
+			m.selAddr = netip.Addr{}
+		}
 	} else {
 		m.selAddr = m.rows[m.cursor].Addr
 	}
@@ -484,9 +688,9 @@ func (m Model) bottomLines() []string {
 		}
 		k := func(key, label string) string { return stKey.Render(key) + " " + label }
 		out = append(out, strings.Join([]string{
-			k("a", "add"), k("r", "remove"), k("d", "delete sel"), k("s", "save"),
-			k("l", "load"), k("R", "re-resolve"), k("p", "pause"), k("o/O", "sort"),
-			k("/", "filter"), k("?", "help"), k("↑↓", "select"), k("q", "quit"),
+			k("tab", "view"), k("a", "add"), k("r", "remove"), k("d", "delete sel"), k("s", "save"),
+			k("S", "report"), k("l", "load"), k("R", "re-resolve"), k("n", "ptr"), k("p", "pause"), k("c", "confirm"),
+			k("o/O", "sort"), k("/", "filter"), k("?", "help"), k("↑↓", "select"), k("q", "quit"),
 		}, "  "))
 	}
 	return out
@@ -508,17 +712,21 @@ func (m Model) tableRows() int {
 	return max(1, m.height-m.headerLines()-footerLines-len(m.bottomLines()))
 }
 
-type cols struct{ ip, dom, hist int }
+type cols struct{ ip, dom, hist, status int }
 
 func (m Model) layout() cols {
 	ipW, domW := len("IP ADDRESS")+1, len("DOMAIN")+1 // +1 for the sort arrow
+	statusW := 8
 	for _, s := range m.all {
 		ipW = max(ipW, len(s.Addr.String()))
 		domW = max(domW, ansi.StringWidth(s.Domain))
+		if s.CandCount > 0 || s.Flap != monitor.FlapNone {
+			statusW = 19 // "○ DOWN FLAPPING ?2/3" fits
+		}
 	}
 	ipW, domW = min(ipW, 39), min(domW, 28)
-	// gutter 2 + status 8 + latency 10 + loss 6 + up 7 + down 7 + spaces
-	fixed := 2 + 8 + 1 + 1 + 10 + 1 + 6 + 7 + 7 + 1
+	// gutter 2 + status + latency 10 + loss 6 + up 7 + down 7 + spaces
+	fixed := 2 + statusW + 1 + 1 + 10 + 1 + 6 + 7 + 7 + 1
 	over := fixed + ipW + domW - m.width
 	if over > 0 {
 		shrink := min(over, domW-6)
@@ -532,7 +740,71 @@ func (m Model) layout() cols {
 	if hist < 8 {
 		hist = 0
 	}
-	return cols{ipW, domW, min(hist, monitor.HistoryLen)}
+	return cols{ipW, domW, min(hist, monitor.HistoryLen), statusW}
+}
+
+// statusText is the STATUS column text: state plus any confirming
+// progress ("?2/3") and flap tier markers.
+func (m Model) statusText(s monitor.Status) string {
+	_, sym := stateStyle(s.State)
+	t := sym + " " + s.State.String()
+	if s.Flap != monitor.FlapNone {
+		t += " " + s.Flap.String()
+	}
+	if s.CandCount > 0 {
+		t += fmt.Sprintf(" ?%d/%d", s.CandCount, m.mon.Confirm())
+	}
+	return t
+}
+
+// hostRow renders one host table line (used by every view).
+func (m Model) hostRow(s monitor.Status, selected bool, c cols) string {
+	st, _ := stateStyle(s.State)
+	gutter := "  "
+	ip := pad(s.Addr.String(), c.ip)
+	if selected {
+		gutter = stSel.Render("▶ ")
+		ip = stSel.Render(ip)
+	}
+	lat := "-"
+	if s.State == monitor.Up {
+		lat = fmtLatency(s.Latency)
+	}
+	dom := pad(s.Domain, c.dom)
+	if s.Domain != "" {
+		dom = stDomain.Render(dom)
+	}
+	line := gutter + st.Render(pad(m.statusText(s), c.status)) + " " + ip + " " + dom + " " +
+		lpad(lat, 10) + " " + lpad(fmt.Sprintf("%.0f%%", s.Loss()*100), 6) +
+		lpad(fmt.Sprint(s.OK), 7) + lpad(fmt.Sprint(s.Fail), 7)
+	if c.hist > 0 {
+		line += "  " + sparkline(s.History, c.hist)
+	}
+	return line
+}
+
+// feedLine renders one delta event for the deltas pane.
+func feedLine(e monitor.Event) string {
+	host := e.Addr.String()
+	if e.Domain != "" {
+		host += " " + stDomain.Render(e.Domain)
+	}
+	t := stDim.Render(e.Time.Format("15:04:05"))
+	was := stDim.Render(fmt.Sprintf("(was %s %s)", strings.ToLower(e.From.String()), e.PrevDuration.Truncate(time.Second)))
+	switch e.Kind {
+	case monitor.EventFlapStart:
+		return fmt.Sprintf("%s  %s  %s  %s", t, host, stPending.Render("started FLAPPING"), was)
+	case monitor.EventFlapRapid:
+		return fmt.Sprintf("%s  %s  %s  %s", t, host, stDown.Render("started RAPID flapping"), was)
+	case monitor.EventFlapSettled:
+		st, _ := stateStyle(e.To)
+		return fmt.Sprintf("%s  %s  %s", t, host, st.Render(fmt.Sprintf("settled %s (was %s, %d changes)",
+			e.To, strings.ToLower(e.Tier.String()), e.Changes)))
+	default:
+		fromSt, _ := stateStyle(e.From)
+		toSt, _ := stateStyle(e.To)
+		return fmt.Sprintf("%s  %s  %s→%s  %s", t, host, fromSt.Render(e.From.String()), toSt.Render(e.To.String()), was)
+	}
 }
 
 func pad(s string, w int) string {
@@ -600,8 +872,12 @@ func (m Model) View() string {
 	var lines []string
 
 	title := stTitle.Render("mincmon v"+Version) + stDim.Render(fmt.Sprintf(
-		"   probe: %s   interval %s   timeout %s   %s",
-		m.mon.ProberName(), m.mon.Interval, m.mon.Timeout, time.Now().Format("2006-01-02 15:04:05")))
+		"   probe: %s   interval %s   timeout %s   confirm %d   view: %s   %s",
+		m.mon.ProberName(), m.mon.Interval, m.mon.Timeout, m.mon.Confirm(), viewNames[m.view],
+		time.Now().Format("2006-01-02 15:04:05")))
+	if unseen := int(m.latestSeq - m.seenSeq); unseen > 0 && m.view != viewDeltas {
+		title += "   " + stDown.Render(fmt.Sprintf("⚠ %d new", unseen))
+	}
 	if m.mon.Paused() {
 		title += "   " + stPending.Render("⏸ PAUSED")
 	}
@@ -624,45 +900,63 @@ func (m Model) View() string {
 		}
 		return pad(name, w)
 	}
-	header := "  " + hdr("STATUS", sortState, 8, false) + " " + hdr("IP ADDRESS", sortIP, c.ip, false) + " " +
+	header := "  " + hdr("STATUS", sortState, c.status, false) + " " + hdr("IP ADDRESS", sortIP, c.ip, false) + " " +
 		hdr("DOMAIN", sortDomain, c.dom, false) + " " + hdr("LATENCY", sortLatency, 10, true) + " " +
 		hdr("LOSS", sortLoss, 6, true) + lpad("UP", 7) + lpad("DOWN", 7)
 	if c.hist > 0 {
 		header += "  " + pad("HISTORY", c.hist)
+	}
+	if m.view == viewDeltas {
+		header = "  CHANGES (newest first) — enter: expand subnet / jump to host"
+		if m.dropped > 0 {
+			header += fmt.Sprintf("   (%d earlier dropped)", m.dropped)
+		}
 	}
 	lines = append(lines, stBold.Render(header))
 	rule := stDim.Render(strings.Repeat("─", max(0, min(ansi.StringWidth(header), m.width))))
 	lines = append(lines, rule)
 
 	vis := m.tableRows()
-	end := min(len(m.rows), m.offset+vis)
+	end := min(m.curLen(), m.offset+vis)
 	for i := m.offset; i < end; i++ {
-		s := m.rows[i]
-		st, sym := stateStyle(s.State)
-		gutter := "  "
-		ip := pad(s.Addr.String(), c.ip)
-		if i == m.cursor {
-			gutter = stSel.Render("▶ ")
-			ip = stSel.Render(ip)
+		if m.view != viewDeltas {
+			lines = append(lines, m.hostRow(m.rows[i], i == m.cursor, c))
+			continue
 		}
-		lat := "-"
-		if s.State == monitor.Up {
-			lat = fmtLatency(s.Latency)
+		r := m.drows[i]
+		switch r.kind {
+		case rowEvent:
+			line := "  " + feedLine(r.ev)
+			if i == m.cursor {
+				line = stSel.Render("▶ ") + feedLine(r.ev)
+			}
+			lines = append(lines, line)
+		case rowCluster:
+			mark := "▸"
+			if m.expanded[r.origin] {
+				mark = "▾"
+			}
+			line := fmt.Sprintf("  %s %s — %s · %s", mark, r.origin,
+				stUp.Render(fmt.Sprintf("%d up", r.up)), stDown.Render(fmt.Sprintf("%d down", r.down)))
+			if r.pend > 0 {
+				line += fmt.Sprintf(" · %s", stPending.Render(fmt.Sprintf("%d pending", r.pend)))
+			}
+			if r.flap > 0 {
+				line += fmt.Sprintf(" · %s", stDown.Render(fmt.Sprintf("%d flapping", r.flap)))
+			}
+			if i == m.cursor {
+				line = stSel.Render(line)
+			}
+			lines = append(lines, line)
+		default: // rowHost, rowFlat
+			lines = append(lines, m.hostRow(r.status, i == m.cursor, c))
 		}
-		dom := pad(s.Domain, c.dom)
-		if s.Domain != "" {
-			dom = stDomain.Render(dom)
-		}
-		line := gutter + st.Render(pad(sym+" "+s.State.String(), 8)) + " " + ip + " " + dom + " " +
-			lpad(lat, 10) + " " + lpad(fmt.Sprintf("%.0f%%", s.Loss()*100), 6) +
-			lpad(fmt.Sprint(s.OK), 7) + lpad(fmt.Sprint(s.Fail), 7)
-		if c.hist > 0 {
-			line += "  " + sparkline(s.History, c.hist)
-		}
-		lines = append(lines, line)
 	}
-	if len(m.rows) == 0 {
+	if m.curLen() == 0 {
 		msg := "  (no hosts — press a to add, l to load)"
+		if m.view == viewDeltas && len(m.all) > 0 {
+			msg = fmt.Sprintf("  (no changes yet — baseline set, watching %d host(s))", len(m.all))
+		}
 		if m.filter != "" {
 			msg = fmt.Sprintf("  (no hosts match filter %q — esc to clear)", m.filter)
 		}
@@ -687,13 +981,17 @@ func (m Model) View() string {
 	}
 	summary := stUp.Render(fmt.Sprintf("UP: %d", up)) + "   " + stDown.Render(fmt.Sprintf("DOWN: %d", down)) +
 		"   " + stPending.Render(fmt.Sprintf("PENDING: %d", pending)) + fmt.Sprintf("   TOTAL: %d", len(m.all))
-	if len(m.rows) > vis {
-		summary += stDim.Render(fmt.Sprintf("   rows %d–%d of %d", m.offset+1, end, len(m.rows)))
+	if m.curLen() > vis {
+		summary += stDim.Render(fmt.Sprintf("   rows %d–%d of %d", m.offset+1, end, m.curLen()))
 	}
 	if m.filter != "" {
 		summary += stDim.Render(fmt.Sprintf("   filter: %q", m.filter))
 	}
-	summary += stDim.Render("   sort: " + sortNames[m.sortKey])
+	if m.view == viewDeltas {
+		summary += stDim.Render(fmt.Sprintf("   events: %d", len(m.events)))
+	} else {
+		summary += stDim.Render("   sort: " + sortNames[m.sortKey])
+	}
 	lines = append(lines, summary)
 	lines = append(lines, m.detailLine(), "")
 	lines = append(lines, m.bottomLines()...)
@@ -705,10 +1003,34 @@ func (m Model) View() string {
 }
 
 func (m Model) detailLine() string {
+	if m.view == viewDeltas {
+		if m.cursor < 0 || m.cursor >= len(m.drows) {
+			return ""
+		}
+		r := m.drows[m.cursor]
+		switch r.kind {
+		case rowCluster:
+			return stSel.Render(r.origin) + stDim.Render(fmt.Sprintf(
+				" — %d host(s): %d up, %d down, %d pending, %d flapping   (enter expands/collapses)",
+				r.up+r.down+r.pend, r.up, r.down, r.pend, r.flap))
+		case rowEvent:
+			for _, s := range m.all {
+				if s.Addr == r.ev.Addr {
+					return m.detailFor(s)
+				}
+			}
+			return stDim.Render(r.ev.Line() + "   (host no longer monitored)")
+		default:
+			return m.detailFor(r.status)
+		}
+	}
 	if len(m.rows) == 0 || m.cursor >= len(m.rows) {
 		return ""
 	}
-	s := m.rows[m.cursor]
+	return m.detailFor(m.rows[m.cursor])
+}
+
+func (m Model) detailFor(s monitor.Status) string {
 	st, _ := stateStyle(s.State)
 	d := stSel.Render(s.Addr.String())
 	if s.Domain != "" {
@@ -721,6 +1043,18 @@ func (m Model) detailLine() string {
 	}
 	d += " " + st.Render(s.State.String()) + stDim.Render(fmt.Sprintf(" for %s (since %s)",
 		time.Since(s.Changed).Truncate(time.Second), s.Changed.Format("15:04:05")))
+	if s.Origin != "" {
+		d += stDim.Render("   from " + s.Origin)
+	}
+	if s.Flap != monitor.FlapNone {
+		d += stDown.Render("   " + s.Flap.String())
+	}
+	if s.CandCount > 0 {
+		d += stPending.Render(fmt.Sprintf("   confirming %s %d/%d", s.CandState, s.CandCount, m.mon.Confirm()))
+	}
+	if s.Changes > 0 {
+		d += stDim.Render(fmt.Sprintf("   changes: %d", s.Changes))
+	}
 	if s.Err != "" {
 		d += stDown.Render("   error: " + s.Err)
 	}
@@ -754,14 +1088,19 @@ func (m Model) helpView() string {
 		return "  " + stKey.Render(pad(key, 12)) + stDim.Render(desc)
 	}
 	rows := [][2]string{
-		{"a", "add hosts (IPs, subnets with refinement, domains)"},
+		{"tab / shift+tab", "cycle view: all → up → down → deltas (deltas is the change feed + subnet clusters)"},
+		{"enter", "in deltas: expand/collapse a subnet cluster, or jump from a change to its host"},
+		{"a", "add hosts (IPs, ranges, subnets with refinement, domains)"},
 		{"r", "remove hosts (blank removes the selected one)"},
 		{"d / Del", "delete the host under the cursor"},
 		{"s", "save the monitor list to a .ml.txt file (atomic)"},
+		{"S", "save the delta report (state-change log) as plain text"},
 		{"l", "load a monitor list"},
 		{"R", "re-resolve selected domains (blank = all), optionally with a different resolver"},
+		{"n", "set/update the selected host's name via reverse DNS (PTR) lookup"},
+		{"c", "set how many consecutive probes confirm a state change (default 3)"},
 		{"p", "pause / resume probing (in-flight probe finishes)"},
-		{"o / O", "cycle sort column / reverse sort direction"},
+		{"o / O", "cycle sort column / reverse sort direction (table views)"},
 		{"/", "filter by IP, domain or state (esc clears)"},
 		{"↑/↓, j/k", "move selection"},
 		{"pgup/pgdn, space", "page up / page down"},

@@ -31,6 +31,25 @@ type Entry struct {
 	Single bool         // Network entry that is exactly one host (/32, /128)
 	Addr   netip.Addr   // the host address when Single (keeps any IPv6 zone)
 	Name   string       // domain name (Domain entries)
+
+	// Range entries ("192.168.1.10-192.168.1.50", "192.168.1.10-50",
+	// "2001:db8::10-2001:db8::50") are Network entries spanning
+	// RangeStart..RangeEnd inclusive; they need not align to a subnet.
+	Range      bool
+	RangeStart netip.Addr
+	RangeEnd   netip.Addr
+	// BadRange is set (with the token kept in Name) when the input clearly
+	// tried to be a range — its left side parses as an IP — but is invalid,
+	// so callers can complain instead of DNS-looking-up nonsense.
+	BadRange string
+}
+
+// RangeLabel is the canonical "start-end" spelling of a range entry.
+func (e Entry) RangeLabel() string {
+	if !e.Range {
+		return ""
+	}
+	return e.RangeStart.String() + "-" + e.RangeEnd.String()
 }
 
 // Target is a monitored host, its (possibly merged) domain label, and the
@@ -40,6 +59,12 @@ type Target struct {
 	Addr     netip.Addr
 	Domain   string
 	Resolver netip.Addr // zero value = system resolver
+	// Origin is the subnet ("10.0.0.0/24") or range
+	// ("192.168.1.10-192.168.1.50") the host was expanded from, used to
+	// group hosts in the deltas view. Empty for single IPs, domain results
+	// and list-loaded hosts. The first origin seen wins; it is not saved
+	// to .ml.txt files, so reloaded hosts have no origin.
+	Origin string
 }
 
 // Classify turns one input token into a network or domain entry. Anything
@@ -65,7 +90,58 @@ func Classify(part string) Entry {
 			Addr:   a,
 		}
 	}
+	if e, ok := parseRange(part); ok {
+		return e
+	}
 	return Entry{Kind: Domain, Name: part}
+}
+
+// parseRange parses an explicit inclusive address range. The full form is
+// "start-end" for IPv4 or IPv6; IPv4 also accepts a shorthand whose right
+// side is just the last octet ("192.168.1.10-50"). It reports ok=false when
+// the token does not look like a range at all (its left side is not an IP),
+// so ordinary hyphenated domains are unaffected. A token whose left side
+// parses as an IP but whose range is malformed yields a BadRange entry.
+func parseRange(part string) (Entry, bool) {
+	loS, hiS, found := strings.Cut(part, "-")
+	if !found || strings.Contains(hiS, "-") {
+		return Entry{}, false
+	}
+	lo, err := netip.ParseAddr(strings.TrimSpace(loS))
+	if err != nil {
+		return Entry{}, false
+	}
+	bad := func(reason string) (Entry, bool) {
+		return Entry{Kind: Network, Name: part, BadRange: reason}, true
+	}
+	if lo.Zone() != "" {
+		return bad("zones are not supported in ranges")
+	}
+	hiS = strings.TrimSpace(hiS)
+	if hi, err := netip.ParseAddr(hiS); err == nil {
+		if hi.Zone() != "" {
+			return bad("zones are not supported in ranges")
+		}
+		if lo.Is4() != hi.Is4() || lo.Is6() != hi.Is6() {
+			return bad("range ends are different address families")
+		}
+		if hi.Compare(lo) < 0 {
+			return bad("range end is before its start")
+		}
+		return Entry{Kind: Network, Range: true, RangeStart: lo, RangeEnd: hi}, true
+	}
+	if lo.Is4() {
+		// Shorthand: right side is the final octet, decimal.
+		if n, err := strconv.ParseUint(hiS, 10, 8); err == nil {
+			b := lo.As4()
+			hi := netip.AddrFrom4([4]byte{b[0], b[1], b[2], byte(n)})
+			if hi.Compare(lo) < 0 {
+				return bad("range end is before its start")
+			}
+			return Entry{Kind: Network, Range: true, RangeStart: lo, RangeEnd: hi}, true
+		}
+	}
+	return bad(fmt.Sprintf("bad range end %q", hiS))
 }
 
 // parsePrefix accepts "addr/len" and IPv4 "addr/dotted.netmask", with host
@@ -214,11 +290,31 @@ func ParseRefine(text string, v6 bool, cap int) (offsets []Offset, refined bool,
 // Expand returns the hosts to monitor for a network entry. Without a
 // refinement it yields the usable hosts (as Python's ipaddress hosts());
 // with one it yields base+offset for each offset inside the prefix.
-// Truncation to cap, out-of-range offsets, and empty results are reported
-// through warn.
-func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string)) []netip.Addr {
+// includeBase keeps the first address (IPv4 network / IPv6 subnet-router
+// anycast) and, for IPv4, the broadcast address in an unrefined expansion
+// instead of skipping them. Range entries expand to every address from
+// start to end inclusive, and are skipped entirely (with a warning) when
+// they span more than cap hosts. Truncation to cap, out-of-range offsets,
+// and empty results are reported through warn.
+func Expand(e Entry, offsets []Offset, refined bool, includeBase bool, cap int, warn func(string)) []netip.Addr {
 	if e.Single {
 		return []netip.Addr{e.Addr}
+	}
+	if e.Range {
+		start, end := addrToU128(e.RangeStart), addrToU128(e.RangeEnd)
+		if end.sub(start).cmp(Offset{0, uint64(cap)}) >= 0 { // count = span+1 > cap
+			warn(fmt.Sprintf("! Range %s expands to more than %d hosts; skipped.", e.RangeLabel(), cap))
+			return nil
+		}
+		var out []netip.Addr
+		for v := start; ; v, _ = v.add(Offset{0, 1}) {
+			a, _ := u128ToAddr(v, e.RangeStart)
+			out = append(out, a)
+			if v == end {
+				break
+			}
+		}
+		return out
 	}
 	p := e.Prefix
 	base := addrToU128(p.Addr())
@@ -267,7 +363,10 @@ func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string))
 		last.lo |= (uint64(1) << uint(hostBits)) - 1
 	}
 	start, end := base, last
-	if p.Addr().Is4() && hostBits > 1 {
+	if includeBase {
+		// Keep network/broadcast (IPv4) and the subnet-router anycast
+		// address (IPv6): the user explicitly asked for them.
+	} else if p.Addr().Is4() && hostBits > 1 {
 		// IPv4: skip network and broadcast (except /31)
 		start, _ = base.add(Offset{0, 1})
 		end = last.sub(Offset{0, 1})
@@ -287,6 +386,17 @@ func Expand(e Entry, offsets []Offset, refined bool, cap int, warn func(string))
 		}
 	}
 	return out
+}
+
+// SkipsBase reports whether an unrefined expansion of e would skip its
+// first address (and, for IPv4, its last): true for IPv4 prefixes with
+// more than one host bit and for IPv6 prefixes likewise. Callers use it to
+// decide whether asking "include network/broadcast?" is meaningful.
+func (e Entry) SkipsBase() bool {
+	if e.Single || e.Range || e.Kind != Network {
+		return false
+	}
+	return e.Prefix.Addr().BitLen()-e.Prefix.Bits() > 1
 }
 
 // HostCount returns min(number of addresses in p, limit).
@@ -331,6 +441,9 @@ func Dedupe(in []Target) []Target {
 		}
 		if !out[i].Resolver.IsValid() {
 			out[i].Resolver = t.Resolver
+		}
+		if out[i].Origin == "" {
+			out[i].Origin = t.Origin
 		}
 	}
 	return out

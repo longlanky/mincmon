@@ -107,11 +107,104 @@ func DomainDetailed(domain string, resolvers []netip.Addr, wantA, wantAAAA bool)
 	return out
 }
 
+// PTR looks up reverse DNS (PTR) hostnames for addr with trailing dots
+// stripped. With resolvers, each server is queried directly (chasing CNAMEs
+// for RFC 2317 delegations); otherwise the system resolver is used.
+func PTR(addr netip.Addr, resolvers []netip.Addr) []string {
+	clean := addr.Unmap().WithZone("")
+	if !clean.IsValid() {
+		return nil
+	}
+	seen := map[string]string{} // lowercase -> first-seen spelling
+	var mu sync.Mutex
+	add := func(name string) {
+		name = strings.TrimRight(strings.TrimSpace(name), ".")
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		mu.Lock()
+		if _, ok := seen[key]; !ok {
+			seen[key] = name
+		}
+		mu.Unlock()
+	}
+	if len(resolvers) > 0 {
+		arpa, err := dns.ReverseAddr(clean.String())
+		if err != nil {
+			return nil
+		}
+		var wg sync.WaitGroup
+		for _, r := range resolvers {
+			wg.Add(1)
+			go func(r netip.Addr) {
+				defer wg.Done()
+				for _, name := range queryPTR(arpa, r) {
+					add(name)
+				}
+			}(r)
+		}
+		wg.Wait()
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		names, _ := net.DefaultResolver.LookupAddr(ctx, clean.String())
+		for _, name := range names {
+			add(name)
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for _, name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func query(domain string, server netip.Addr, qtype uint16) []netip.Addr {
-	addr := netip.AddrPortFrom(server.WithZone(""), 53).String()
-	c := &dns.Client{Timeout: timeout}
-	name := dns.Fqdn(domain)
 	var out []netip.Addr
+	exchange(domain, server, qtype, func(rr dns.RR) bool {
+		switch v := rr.(type) {
+		case *dns.A:
+			if qtype == dns.TypeA {
+				if a, ok := netip.AddrFromSlice(v.A); ok {
+					out = append(out, a.Unmap())
+					return true
+				}
+			}
+		case *dns.AAAA:
+			if qtype == dns.TypeAAAA {
+				if a, ok := netip.AddrFromSlice(v.AAAA); ok {
+					out = append(out, a)
+					return true
+				}
+			}
+		}
+		return false
+	})
+	return out
+}
+
+func queryPTR(arpa string, server netip.Addr) []string {
+	var out []string
+	exchange(arpa, server, dns.TypePTR, func(rr dns.RR) bool {
+		if v, ok := rr.(*dns.PTR); ok {
+			out = append(out, v.Ptr)
+			return true
+		}
+		return false
+	})
+	return out
+}
+
+func exchange(fqdn string, server netip.Addr, qtype uint16, collect func(dns.RR) bool) {
+	addr := netip.AddrPortFrom(server.WithZone(""), 53).String()
+	exchangeAddr(fqdn, addr, qtype, collect)
+}
+
+func exchangeAddr(fqdn, addr string, qtype uint16, collect func(dns.RR) bool) {
+	c := &dns.Client{Timeout: timeout}
+	name := dns.Fqdn(fqdn)
 	for chase := 0; chase <= maxCNAMEChase; chase++ {
 		m := new(dns.Msg)
 		m.SetQuestion(name, qtype)
@@ -121,35 +214,24 @@ func query(domain string, server netip.Addr, qtype uint16) []netip.Addr {
 			resp, _, err = c.Exchange(m, addr)
 		}
 		if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-			return out
+			return
 		}
 		var cname string
+		got := false
 		for _, rr := range resp.Answer {
-			switch v := rr.(type) {
-			case *dns.A:
-				if qtype == dns.TypeA {
-					if a, ok := netip.AddrFromSlice(v.A); ok {
-						out = append(out, a.Unmap())
-					}
-				}
-			case *dns.AAAA:
-				if qtype == dns.TypeAAAA {
-					if a, ok := netip.AddrFromSlice(v.AAAA); ok {
-						out = append(out, a)
-					}
-				}
-			case *dns.CNAME:
-				if cname == "" {
-					cname = v.Target
-				}
+			if collect(rr) {
+				got = true
+				continue
+			}
+			if v, ok := rr.(*dns.CNAME); ok && cname == "" {
+				cname = v.Target
 			}
 		}
-		if len(out) > 0 || cname == "" || strings.EqualFold(cname, name) {
-			return out
+		if got || cname == "" || strings.EqualFold(cname, name) {
+			return
 		}
 		// Server gave only a CNAME: follow it on the same server.
 		name = cname
 		c.Net = ""
 	}
-	return out
 }

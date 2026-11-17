@@ -73,7 +73,7 @@ func TestExpand(t *testing.T) {
 			t.Fatalf("%s: ParseRefine(%q): %v", c.net, c.refine, err)
 		}
 		warned := false
-		got := Expand(e, offs, refined, HostCap, func(string) { warned = true })
+		got := Expand(e, offs, refined, false, HostCap, func(string) { warned = true })
 		if len(got) != c.n || warned != c.warned {
 			t.Errorf("%s %q: got %d hosts (warned=%v), want %d (warned=%v)", c.net, c.refine, len(got), warned, c.n, c.warned)
 			continue
@@ -137,12 +137,70 @@ func TestHostCount(t *testing.T) {
 	}
 }
 
+func TestClassifyRanges(t *testing.T) {
+	good := map[string][2]string{
+		"192.168.1.10-192.168.1.50":  {"192.168.1.10", "192.168.1.50"},
+		"192.168.1.10-50":            {"192.168.1.10", "192.168.1.50"},
+		"192.168.1.250-192.168.2.10": {"192.168.1.250", "192.168.2.10"},
+		"2001:db8::10-2001:db8::50":  {"2001:db8::10", "2001:db8::50"},
+		"192.168.1.0-192.168.1.255":  {"192.168.1.0", "192.168.1.255"},
+	}
+	for in, want := range good {
+		e := Classify(in)
+		if !e.Range || e.BadRange != "" || e.RangeStart.String() != want[0] || e.RangeEnd.String() != want[1] {
+			t.Errorf("Classify(%q) = %+v, want range %s-%s", in, e, want[0], want[1])
+		}
+		if e.RangeLabel() != want[0]+"-"+want[1] {
+			t.Errorf("Classify(%q) label = %q", in, e.RangeLabel())
+		}
+	}
+	for _, in := range []string{"192.168.1.50-192.168.1.10", "192.168.1.50-10", "192.168.1.10-999",
+		"192.168.1.10-2001:db8::1", "192.168.1.10-foo"} {
+		if e := Classify(in); e.BadRange == "" {
+			t.Errorf("Classify(%q) = %+v, want BadRange", in, e)
+		}
+	}
+	// Hyphenated domains are still domains.
+	if e := Classify("my-host.example.com"); e.Kind != Domain || e.BadRange != "" {
+		t.Errorf("hyphenated domain = %+v", e)
+	}
+}
+
+func TestExpandRange(t *testing.T) {
+	e := Classify("192.168.1.10-12")
+	got := Expand(e, nil, false, false, HostCap, func(string) {})
+	if len(got) != 3 || got[0].String() != "192.168.1.10" || got[2].String() != "192.168.1.12" {
+		t.Errorf("range expand = %v", got)
+	}
+	warned := false
+	if got := Expand(Classify("10.0.0.0-10.0.8.0"), nil, false, false, HostCap, func(string) { warned = true }); got != nil || !warned {
+		t.Errorf("oversize range = %v warned=%v, want skipped with warning", got, warned)
+	}
+}
+
+func TestExpandIncludeBase(t *testing.T) {
+	e := Classify("10.0.0.0/30")
+	got := Expand(e, nil, false, true, HostCap, func(string) {})
+	if len(got) != 4 || got[0].String() != "10.0.0.0" || got[3].String() != "10.0.0.3" {
+		t.Errorf("includeBase v4 = %v", got)
+	}
+	got = Expand(Classify("2001:db8::/126"), nil, false, true, HostCap, func(string) {})
+	if len(got) != 4 || got[0].String() != "2001:db8::" {
+		t.Errorf("includeBase v6 = %v", got)
+	}
+	if !Classify("10.0.0.0/24").SkipsBase() || Classify("10.0.0.0/31").SkipsBase() ||
+		Classify("10.0.0.1").SkipsBase() || Classify("192.168.1.10-50").SkipsBase() {
+		t.Errorf("SkipsBase wrong")
+	}
+}
+
 func TestDedupe(t *testing.T) {
 	a, b := netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("2.2.2.2")
 	r1, r2 := netip.MustParseAddr("10.0.0.53"), netip.MustParseAddr("10.0.1.53")
 	got := Dedupe([]Target{{Addr: a, Domain: "a.com", Resolver: r1}, {Addr: a, Domain: "b.com"},
-		{Addr: b, Domain: ""}, {Addr: b, Domain: "c.com"}, {Addr: a, Domain: "a.com", Resolver: r2}})
-	want := []Target{{Addr: a, Domain: "a.com, b.com", Resolver: r1}, {Addr: b, Domain: "c.com"}}
+		{Addr: b, Domain: ""}, {Addr: b, Domain: "c.com"}, {Addr: a, Domain: "a.com", Resolver: r2},
+		{Addr: b, Origin: "10.0.0.0/24"}, {Addr: b, Origin: "10.0.0.0/25"}})
+	want := []Target{{Addr: a, Domain: "a.com, b.com", Resolver: r1}, {Addr: b, Domain: "c.com", Origin: "10.0.0.0/24"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Dedupe = %v, want %v", got, want)
 	}

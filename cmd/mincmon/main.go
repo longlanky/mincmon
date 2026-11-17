@@ -50,6 +50,7 @@ func run() int {
 	resolvers := flag.String("resolver", "", "DNS resolver `IPs` for domains, comma separated, or \"system\" (default: ask)")
 	records := flag.String("records", "", "`types` to resolve for domains: A, AAAA or both (default: ask)")
 	backend := flag.String("backend", "auto", "probe `backend`: auto, icmp, raw or exec")
+	confirm := flag.Int("confirm", monitor.DefaultConfirm, "consecutive probes to confirm a state change (1-10)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags] [IP|CIDR|domain ...]\n\n"+
@@ -76,6 +77,9 @@ func run() int {
 	}
 	if *interval <= 0 || *timeout <= 0 {
 		return fail("interval and timeout must be positive")
+	}
+	if *confirm < 1 || *confirm > 10 {
+		return fail("--confirm must be between 1 and 10")
 	}
 
 	dns := app.DNSOptions{}
@@ -123,6 +127,7 @@ func run() int {
 
 	fmt.Printf("mincmon v%s  (probe: %s)\n\n", tui.Version, prober.Name())
 	sp := stdinPrompter{bufio.NewReader(os.Stdin)}
+	sess := &app.Session{}
 	var ts []targets.Target
 
 	if *file != "" {
@@ -137,7 +142,7 @@ func run() int {
 	}
 	input := strings.Join(flag.Args(), ",")
 	if *file == "" && input == "" {
-		input, err = sp.Prompt("Input IP addresses, subnets, and/or domains to monitor, " +
+		input, err = sp.Prompt("Input IP addresses, ranges, subnets, and/or domains to monitor, " +
 			"or enter 'load' to load an existing save:\n> ")
 		if err != nil {
 			fmt.Println("Exiting.")
@@ -152,7 +157,7 @@ func run() int {
 		}
 	}
 	if entries := targets.ParseEntries(input); len(entries) > 0 {
-		resolved, err := app.ResolveEntries(entries, sp, dns)
+		resolved, err := app.ResolveEntries(entries, sp, dns, sess)
 		if err != nil {
 			fmt.Println("Exiting.")
 			return 0
@@ -164,8 +169,12 @@ func run() int {
 		fmt.Println("No target hosts resolved. Exiting.")
 		return 0
 	}
+	if len(ts) > targets.HostCap {
+		return fail("%d hosts exceeds the %d-host limit; refine a subnet or split the list", len(ts), targets.HostCap)
+	}
 
 	mon := monitor.New(prober, *interval, *timeout)
+	mon.SetConfirm(*confirm)
 	// Ensure Ctrl-C / SIGTERM during the TUI still stops workers cleanly.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -175,7 +184,7 @@ func run() int {
 		mon.Stop()
 	}()
 	mon.Add(ts)
-	err = tui.Run(mon, dns, hint)
+	err = tui.Run(mon, dns, sess, hint)
 	mon.Stop()
 	signal.Stop(sigCh)
 	if err != nil {

@@ -29,8 +29,8 @@ func (fake) Close() error { return nil }
 // counting records how many probes were sent and blocks until each is
 // released, so the test controls probe timing precisely.
 type counting struct {
-	mu     sync.Mutex
-	count  int
+	mu      sync.Mutex
+	count   int
 	release chan struct{}
 }
 
@@ -44,8 +44,8 @@ func (c *counting) Probe(ctx context.Context, _ netip.Addr, _ time.Duration) (ti
 	}
 	return time.Millisecond, nil
 }
-func (*counting) Name() string   { return "counting" }
-func (*counting) Close() error   { return nil }
+func (*counting) Name() string { return "counting" }
+func (*counting) Close() error { return nil }
 
 func TestPauseResume(t *testing.T) {
 	c := &counting{release: make(chan struct{})}
@@ -78,6 +78,159 @@ func TestPauseResume(t *testing.T) {
 	m.Stop()
 }
 
+// stuck blocks every probe until its context ends, so tests can drive
+// record() by hand without worker interference.
+type stuck struct{}
+
+func (stuck) Probe(ctx context.Context, _ netip.Addr, _ time.Duration) (time.Duration, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+func (stuck) Name() string { return "stuck" }
+func (stuck) Close() error { return nil }
+
+func fakeClock(m *Monitor) *time.Time {
+	now := time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return now }
+	return &now
+}
+
+func TestConfirmAndBaseline(t *testing.T) {
+	m := New(stuck{}, time.Hour, time.Second)
+	defer m.Stop()
+	now := fakeClock(m)
+	a := netip.MustParseAddr("10.0.0.1")
+	m.Add([]targets.Target{{Addr: a}})
+	up := func() { m.record(a, time.Millisecond, nil) }
+	down := func() { m.record(a, 0, probe.ErrTimeout) }
+
+	up() // baseline: silent, immediate
+	if ev, _, _ := m.Events(); len(ev) != 0 {
+		t.Fatalf("baseline produced events %v", ev)
+	}
+	down()
+	down()
+	if s := m.Snapshot()[0]; s.State != Up || s.CandState != Down || s.CandCount != 2 {
+		t.Fatalf("mid-confirm: %+v", s)
+	}
+	up() // resets the streak
+	*now = now.Add(4 * time.Minute)
+	down()
+	down()
+	down() // third consecutive: confirmed flip
+	s := m.Snapshot()[0]
+	if s.State != Down || s.CandCount != 0 || s.Changes != 1 {
+		t.Fatalf("after confirm: %+v", s)
+	}
+	ev, dropped, seq := m.Events()
+	if len(ev) != 1 || dropped != 0 || seq != 1 || ev[0].Kind != EventChange ||
+		ev[0].From != Up || ev[0].To != Down || ev[0].PrevDuration != 4*time.Minute {
+		t.Fatalf("events = %+v dropped=%d seq=%d", ev, dropped, seq)
+	}
+	if got := m.SetConfirm(99); got != 10 || m.Confirm() != 10 {
+		t.Fatalf("SetConfirm clamp = %d", got)
+	}
+}
+
+func TestFlapSlowAndSettle(t *testing.T) {
+	m := New(stuck{}, time.Hour, time.Second)
+	defer m.Stop()
+	m.SetConfirm(1)
+	now := fakeClock(m)
+	a := netip.MustParseAddr("10.0.0.2")
+	m.Add([]targets.Target{{Addr: a}})
+	flip := func() { // record the opposite of the confirmed state
+		if m.Snapshot()[0].State == Up {
+			m.record(a, 0, probe.ErrTimeout)
+		} else {
+			m.record(a, time.Millisecond, nil)
+		}
+	}
+	m.record(a, time.Millisecond, nil) // baseline UP
+	for i := 0; i < 4; i++ {
+		*now = now.Add(90 * time.Second)
+		flip()
+	}
+	ev, _, _ := m.Events()
+	// 3 plain changes, then flap entry instead of the 4th change line.
+	if len(ev) != 4 || ev[0].Kind != EventFlapStart || ev[0].Tier != FlapSlow {
+		t.Fatalf("flap events = %+v", ev)
+	}
+	if s := m.Snapshot()[0]; s.Flap != FlapSlow {
+		t.Fatalf("flap tier = %v", s.Flap)
+	}
+	*now = now.Add(90 * time.Second)
+	flip() // suppressed while flapping (state still flips internally)
+	if ev, _, _ := m.Events(); len(ev) != 4 {
+		t.Fatalf("flapping produced extra events %v", ev)
+	}
+	// Settle: probe agrees with the confirmed state after 5m stable.
+	cur := m.Snapshot()[0].State
+	*now = now.Add(FlapSettleSlow + time.Second)
+	if cur == Up {
+		m.record(a, time.Millisecond, nil)
+	} else {
+		m.record(a, 0, probe.ErrTimeout)
+	}
+	ev, _, _ = m.Events()
+	if len(ev) != 5 || ev[0].Kind != EventFlapSettled || ev[0].To != cur || ev[0].Changes != 2 {
+		t.Fatalf("settled events = %+v", ev)
+	}
+	if s := m.Snapshot()[0]; s.Flap != FlapNone {
+		t.Fatalf("flap after settle = %v", s.Flap)
+	}
+}
+
+func TestFlapRapidAndSettle(t *testing.T) {
+	m := New(stuck{}, time.Hour, time.Second)
+	defer m.Stop()
+	m.SetConfirm(1)
+	now := fakeClock(m)
+	a := netip.MustParseAddr("10.0.0.3")
+	m.Add([]targets.Target{{Addr: a}})
+	m.record(a, time.Millisecond, nil) // baseline UP
+	state := Up
+	for i := 0; i < 4; i++ {
+		*now = now.Add(10 * time.Second)
+		if state == Up {
+			m.record(a, 0, probe.ErrTimeout)
+			state = Down
+		} else {
+			m.record(a, time.Millisecond, nil)
+			state = Up
+		}
+	}
+	ev, _, _ := m.Events()
+	if len(ev) != 4 || ev[0].Kind != EventFlapRapid || ev[0].Tier != FlapRapid {
+		t.Fatalf("rapid events = %+v", ev)
+	}
+	*now = now.Add(FlapSettleRapid + time.Second)
+	m.record(a, time.Millisecond, nil) // agrees with settled UP
+	ev, _, _ = m.Events()
+	if len(ev) != 5 || ev[0].Kind != EventFlapSettled || ev[0].Tier != FlapRapid || ev[0].To != Up {
+		t.Fatalf("rapid settled = %+v", ev)
+	}
+}
+
+func TestEventCap(t *testing.T) {
+	m := New(stuck{}, time.Hour, time.Second)
+	defer m.Stop()
+	m.SetConfirm(1)
+	var ts []targets.Target
+	for i := 0; i < EventCap+100; i++ {
+		ts = append(ts, targets.Target{Addr: netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})})
+	}
+	m.Add(ts)
+	for _, tg := range ts {
+		m.record(tg.Addr, time.Millisecond, nil) // baseline
+		m.record(tg.Addr, 0, probe.ErrTimeout)   // one change each
+	}
+	ev, dropped, seq := m.Events()
+	if len(ev) != EventCap || dropped != 100 || seq != uint64(EventCap+100) || ev[0].Seq != seq || ev[len(ev)-1].Seq != 101 {
+		t.Fatalf("cap: len=%d dropped=%d seq=%d", len(ev), dropped, seq)
+	}
+}
+
 func TestMonitor(t *testing.T) {
 	m := New(fake{}, 10*time.Millisecond, time.Second)
 	defer m.Stop()
@@ -106,5 +259,28 @@ func TestMonitor(t *testing.T) {
 	}
 	if ts := m.Targets(); len(ts) != 1 || ts[0].Addr != down {
 		t.Errorf("targets after remove: %v", ts)
+	}
+}
+
+func TestTargetAndSetDomain(t *testing.T) {
+	m := New(fake{}, time.Hour, time.Second)
+	defer m.Stop()
+	addr := netip.MustParseAddr("192.0.2.10")
+	res := netip.MustParseAddr("1.1.1.1")
+	m.Add([]targets.Target{{Addr: addr, Domain: "old.example.com", Resolver: res}})
+
+	got, ok := m.Target(addr)
+	if !ok || got.Domain != "old.example.com" || got.Resolver != res {
+		t.Fatalf("Target = %+v, %v", got, ok)
+	}
+	if !m.SetDomain(addr, "new.example.com") {
+		t.Fatal("SetDomain returned false for monitored addr")
+	}
+	got, ok = m.Target(addr)
+	if !ok || got.Domain != "new.example.com" || got.Resolver != res {
+		t.Fatalf("Target after SetDomain = %+v, %v", got, ok)
+	}
+	if m.SetDomain(netip.MustParseAddr("192.0.2.99"), "x.example.com") {
+		t.Fatal("SetDomain returned true for unmonitored addr")
 	}
 }

@@ -1,6 +1,18 @@
 # ✨ mincmon Changelog
 
-## Unreleased
+## v1.3.0 — Delta monitoring, reverse DNS lookup & GPL-3.0 licensing
+
+### 🔔 Delta monitoring & UI
+
+* 📋 **Classic `all` view remains the default; `Tab` cycles `all → up → down → deltas`.** The `deltas` view is a newest-first feed of confirmed state changes (`09:41:03 192.168.1.5 DOWN→UP (was down 4m32s)`) with collapsed subnet clusters below it (`Enter` expands a cluster, or jumps from a feed line to its host). Hosts with no origin subnet (single IPs, domains, loaded lists) list flat. While you're in another view, a **`⚠ N new`** badge in the title counts unseen changes; opening deltas clears it. The last 500 events are kept (drops are counted in the header).
+* 🔎 **Reverse DNS (PTR) lookup (`n`).** Look up the selected host's hostname via PTR record using the system resolver (blank/`system`) or custom resolver IP(s) (or `--resolver` when set). IP-only hosts get their hostname set immediately; hosts that already have a different hostname prompt `(y/N)` before replacing it (trailing dots stripped, resolver provenance kept).
+* 🧘 **Confirmed state changes (`--confirm`, key `c`).** A flip now needs 3 consecutive opposing probes by default (1–10, changeable live), everywhere in the UI. Baselines stay instant and silent: a host's first probe sets its state with no feed entry, whenever it joins. While confirming, the status shows `?2/3`. Impact: one lost packet no longer manufactures a down/up pair of "events".
+* 🌊 **Flap tracking.** 4 confirmed changes in 5 min → **FLAPPING**, 4 in 1 min → **RAPID**; per-change feed lines stop, one line marks the start (and any escalation), and a “settled as UP/DOWN (N changes while flapping)” line closes it out after 5 (RAPID: 2) stable minutes.
+* 🧭 **Explicit ranges + subnet origins.** Add `192.168.1.10-192.168.1.50`, shorthand `192.168.1.10-50`, or IPv6 ranges; ranges may cross /24s, and hosts remember the subnet/range they came from for clustering (first origin wins; not persisted to `.ml.txt`). Removal by range works too.
+* 🏳️ **Network/broadcast prompt.** Blank-refining a subnet now asks whether to include its network+broadcast addresses (IPv6: subnet-router anycast): `y` = this subnet, `a` = always this session, Enter/`n` = previous behaviour. Refined offsets that list 0/last were always honoured and still are.
+* 🚧 **One 1024-host cap per session.** Adds/loads/re-resolves that would push the total past 1024 are refused whole, with counts, instead of silently truncating mid-list. (A single oversized subnet still expands to its first 1024 hosts with a warning, as before.)
+* 📝 **Delta report (`S`).** Saves the event feed as plain text (header with probe settings and current up/down/flapping counts, one line per change, dropped-event note). `s` still saves `.ml.txt` lists.
+* 🧪 Tested: new unit tests for range parsing/expansion, confirm-N and flap state machines, event-log capping, network/broadcast prompts, the session cap, confirm/report flows, and deltas-view construction/navigation; `go test ./...` green and `go vet` clean on Linux, Windows and macOS. A PTY smoke run verified all four views, the include prompt, cluster display and report saving end to end.
 
 ### 📜 Licensing
 

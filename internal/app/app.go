@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"mincmon/internal/monitor"
 	"mincmon/internal/resolve"
@@ -31,6 +32,14 @@ type Prompter interface {
 	Notify(text string)
 }
 
+// Session carries interactive choices that persist across flows for one
+// run of the program (startup prompts and every TUI 'a' add share it).
+type Session struct {
+	// IncludeBaseAlways records an "always this session" answer to the
+	// include-network/broadcast prompt.
+	IncludeBaseAlways bool
+}
+
 // DNSOptions pre-answers the resolver / record-type prompts (from CLI
 // flags). Unset fields are asked interactively.
 type DNSOptions struct {
@@ -43,13 +52,21 @@ type DNSOptions struct {
 
 // ResolveEntries expands networks (asking for refinements of non-single
 // subnets) and resolves domains (asking for resolvers and record types).
-// The result is not yet de-duplicated.
-func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targets.Target, error) {
+// sess carries session-wide prompt answers (it may be nil, meaning a
+// throwaway session). The result is not yet de-duplicated.
+func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions, sess *Session) ([]targets.Target, error) {
+	if sess == nil {
+		sess = &Session{}
+	}
 	var out []targets.Target
 	var domains []string
 	warn := func(s string) { p.Notify(s) }
 
 	for _, e := range entries {
+		if e.BadRange != "" {
+			p.Notify(fmt.Sprintf("! Invalid range %q: %s; skipped.", e.Name, e.BadRange))
+			continue
+		}
 		if e.Kind == targets.Domain {
 			if targets.LooksLikeNetwork(e.Name) {
 				p.Notify(fmt.Sprintf("! %q looks like a subnet but didn't parse; treating as a domain.", e.Name))
@@ -59,6 +76,12 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 		}
 		if e.Single {
 			out = append(out, targets.Target{Addr: e.Addr})
+			continue
+		}
+		if e.Range {
+			for _, a := range targets.Expand(e, nil, false, false, targets.HostCap, warn) {
+				out = append(out, targets.Target{Addr: a, Origin: e.RangeLabel()})
+			}
 			continue
 		}
 		v6 := e.Prefix.Addr().Is6()
@@ -91,8 +114,16 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 			}
 			break
 		}
-		for _, a := range targets.Expand(e, offsets, refined, targets.HostCap, warn) {
-			out = append(out, targets.Target{Addr: a})
+		includeBase := false
+		if !refined && e.SkipsBase() {
+			ib, err := askIncludeBase(e, p, sess)
+			if err != nil {
+				return nil, err
+			}
+			includeBase = ib
+		}
+		for _, a := range targets.Expand(e, offsets, refined, includeBase, targets.HostCap, warn) {
+			out = append(out, targets.Target{Addr: a, Origin: e.Prefix.String()})
 		}
 	}
 
@@ -106,17 +137,7 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 		if err != nil {
 			return nil, err
 		}
-		resolvers = nil
-		for _, r := range strings.Split(raw, ",") {
-			if r = strings.TrimSpace(r); r == "" {
-				continue
-			}
-			if a, err := netip.ParseAddr(r); err == nil {
-				resolvers = append(resolvers, a.WithZone(""))
-			} else {
-				p.Notify(fmt.Sprintf("! ignoring invalid resolver %q", r))
-			}
-		}
+		resolvers = parseResolvers(raw, p)
 	}
 	wantA, wantAAAA := opt.WantA, opt.WantAAAA
 	if !opt.RecordsSet {
@@ -136,6 +157,158 @@ func ResolveEntries(entries []targets.Entry, p Prompter, opt DNSOptions) ([]targ
 		}
 	}
 	return out, nil
+}
+
+// askIncludeBase asks whether an unrefined subnet expansion should keep
+// its network+broadcast addresses (IPv4) or subnet-router anycast address
+// (IPv6). "always" is remembered on the session. Refined expansions never
+// ask: offsets the user listed literally are always honoured.
+func askIncludeBase(e targets.Entry, p Prompter, sess *Session) (bool, error) {
+	if sess.IncludeBaseAlways {
+		return true, nil
+	}
+	base := e.Prefix.Masked().Addr()
+	var q string
+	if base.Is4() {
+		b := base.As4()
+		hostBits := 32 - e.Prefix.Bits()
+		var last uint32 = 0xffffffff
+		if hostBits < 32 {
+			last = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+			last |= (uint32(1) << uint(hostBits)) - 1
+		}
+		bcast := netip.AddrFrom4([4]byte{byte(last >> 24), byte(last >> 16), byte(last >> 8), byte(last)})
+		q = fmt.Sprintf("Include network+broadcast (%s and %s) of %s? (y = this subnet, a = always this session, Enter/n = no): ",
+			base, bcast, e.Prefix)
+	} else {
+		q = fmt.Sprintf("Include the subnet-router anycast address %s of %s? (y = this subnet, a = always this session, Enter/n = no): ",
+			base, e.Prefix)
+	}
+	for {
+		ans, err := p.Prompt(q)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(strings.TrimSpace(ans)) {
+		case "y", "yes":
+			return true, nil
+		case "a", "always":
+			sess.IncludeBaseAlways = true
+			return true, nil
+		case "", "n", "no":
+			return false, nil
+		default:
+			p.Notify("! Answer y (this subnet), a (always this session), or Enter/n (no).")
+		}
+	}
+}
+
+// addCapped adds ts to the monitor unless the new unique hosts would push
+// the session past targets.HostCap, in which case nothing is added.
+// It returns the added addresses and, when capped, an explanation instead.
+func addCapped(m *monitor.Monitor, ts []targets.Target) (added []netip.Addr, cappedMsg string) {
+	existing := map[netip.Addr]bool{}
+	for _, t := range m.Targets() {
+		existing[t.Addr] = true
+	}
+	fresh := 0
+	for _, t := range targets.Dedupe(ts) {
+		if !existing[t.Addr] {
+			fresh++
+		}
+	}
+	if len(existing)+fresh > targets.HostCap {
+		return nil, fmt.Sprintf("Adding %d new host(s) would exceed the %d-host limit (%d currently monitored); nothing added.",
+			fresh, targets.HostCap, len(existing))
+	}
+	return m.Add(ts), ""
+}
+
+// ChangeConfirm asks for and applies a new state-change confirmation
+// threshold (consecutive opposing probes before a flip counts).
+func ChangeConfirm(m *monitor.Monitor, p Prompter) string {
+	for {
+		raw, err := p.Prompt(fmt.Sprintf(
+			"Confirm a state change after how many consecutive probes? (current %d, 1-10, 1 = instant): ", m.Confirm()))
+		if err != nil {
+			return "Confirm change cancelled."
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || n < 1 || n > 10 {
+			p.Notify("! Enter a number from 1 to 10.")
+			continue
+		}
+		applied := m.SetConfirm(n)
+		return fmt.Sprintf("State changes now need %d consecutive probe(s); in-progress counters were reset.", applied)
+	}
+}
+
+// FormatReport renders the plain-text delta report: a header (generation
+// time, probing parameters, current counts) then every retained delta
+// event, oldest first.
+func FormatReport(m *monitor.Monitor, now time.Time) string {
+	events, dropped, _ := m.Events()
+	snap := m.Snapshot()
+	up, down, pending, flapping := 0, 0, 0, 0
+	for _, s := range snap {
+		switch s.State {
+		case monitor.Up:
+			up++
+		case monitor.Down:
+			down++
+		default:
+			pending++
+		}
+		if s.Flap != monitor.FlapNone {
+			flapping++
+		}
+	}
+	var b strings.Builder
+	b.WriteString("mincmon delta report\n")
+	fmt.Fprintf(&b, "generated: %s\n", now.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "probe: %s   interval %s   timeout %s   confirm %d\n",
+		m.ProberName(), m.Interval, m.Timeout, m.Confirm())
+	fmt.Fprintf(&b, "hosts: %d total   %d up   %d down   %d pending   %d flapping\n",
+		len(snap), up, down, pending, flapping)
+	fmt.Fprintf(&b, "delta events: %d", len(events))
+	if dropped > 0 {
+		fmt.Fprintf(&b, " (%d earlier event(s) dropped, log keeps last %d)", dropped, monitor.EventCap)
+	}
+	b.WriteString("\n\n")
+	if len(events) == 0 {
+		b.WriteString("(no state changes since monitoring started)\n")
+	}
+	// Events() is newest-first; the report reads oldest-first.
+	for i := len(events) - 1; i >= 0; i-- {
+		b.WriteString(events[i].Line())
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// SaveReport asks for a filename and writes the delta report as plain
+// text ('S' in the TUI; 's' still saves .ml.txt monitor lists).
+func SaveReport(m *monitor.Monitor, p Prompter) string {
+	name, err := p.Prompt("Enter report filename (extension '.txt' auto-appended if missing): ")
+	name = strings.TrimSpace(name)
+	if err != nil || name == "" {
+		return "Report save cancelled."
+	}
+	path := name
+	if filepath.Ext(path) == "" {
+		path += ".txt"
+	}
+	if _, err := os.Stat(path); err == nil {
+		ans, err := p.Prompt(fmt.Sprintf("%s exists. Overwrite? (y/N): ", path))
+		if err != nil || !strings.EqualFold(strings.TrimSpace(ans), "y") {
+			return "Report save cancelled."
+		}
+	}
+	events, _, _ := m.Events()
+	if err := os.WriteFile(path, []byte(FormatReport(m, time.Now())), 0o644); err != nil {
+		return fmt.Sprintf("Report save failed: %v", err)
+	}
+	return fmt.Sprintf("Saved %d delta event(s) to %s", len(events), path)
 }
 
 // ParseRecords maps "A", "AAAA", "both"/blank to record types. Invalid
@@ -161,7 +334,7 @@ func ParseRecordsStrict(s string) (wantA, wantAAAA bool, err error) {
 }
 
 // Add asks for targets and starts monitoring them.
-func Add(m *monitor.Monitor, p Prompter, opt DNSOptions) string {
+func Add(m *monitor.Monitor, p Prompter, opt DNSOptions, sess *Session) string {
 	raw, err := p.Prompt("Add IP(s)/range(s)/domain(s) (comma separated): ")
 	if err != nil || strings.TrimSpace(raw) == "" {
 		return "Add cancelled."
@@ -170,11 +343,14 @@ func Add(m *monitor.Monitor, p Prompter, opt DNSOptions) string {
 	if len(entries) == 0 {
 		return "No valid entries."
 	}
-	ts, err := ResolveEntries(entries, p, opt)
+	ts, err := ResolveEntries(entries, p, opt, sess)
 	if err != nil {
 		return "Add cancelled."
 	}
-	added := m.Add(targets.Dedupe(ts))
+	added, capped := addCapped(m, targets.Dedupe(ts))
+	if capped != "" {
+		return capped
+	}
 	if len(added) == 0 {
 		if len(ts) == 0 {
 			return "Nothing matched (refinement was empty or out of range)."
@@ -229,6 +405,10 @@ func RemoveMatching(m *monitor.Monitor, raw string) string {
 				}
 			case e.Single:
 				if normAddr(t.Addr) == normAddr(e.Addr) {
+					drop = append(drop, t.Addr)
+				}
+			case e.Range:
+				if a := normAddr(t.Addr); a.Compare(e.RangeStart) >= 0 && a.Compare(e.RangeEnd) <= 0 {
 					drop = append(drop, t.Addr)
 				}
 			case e.Prefix.Contains(normAddr(t.Addr)):
@@ -324,7 +504,10 @@ func Load(m *monitor.Monitor, p Prompter) string {
 	if len(items) == 0 {
 		return msg
 	}
-	added := m.Add(targets.Dedupe(items))
+	added, capped := addCapped(m, targets.Dedupe(items))
+	if capped != "" {
+		return capped
+	}
 	if len(added) == 0 {
 		return fmt.Sprintf("%s (0 new - already monitored).", msg)
 	}
@@ -408,16 +591,7 @@ func Reresolve(m *monitor.Monitor, p Prompter, opt DNSOptions) string {
 		} else if strings.EqualFold(raw, "system") {
 			override, useOverride = nil, true
 		} else {
-			for _, r := range strings.Split(raw, ",") {
-				if r = strings.TrimSpace(r); r == "" {
-					continue
-				}
-				if a, err := netip.ParseAddr(r); err == nil {
-					override = append(override, a.WithZone(""))
-				} else {
-					p.Notify(fmt.Sprintf("! ignoring invalid resolver %q", r))
-				}
-			}
+			override = parseResolvers(raw, p)
 			useOverride = true
 		}
 	}
@@ -455,7 +629,88 @@ func Reresolve(m *monitor.Monitor, p Prompter, opt DNSOptions) string {
 			ts = append(ts, targets.Target{Addr: r.Addr, Domain: d, Resolver: r.Resolver})
 		}
 	}
-	added := m.Add(targets.Dedupe(ts))
+	added, capped := addCapped(m, targets.Dedupe(ts))
+	if capped != "" {
+		return capped
+	}
 	return fmt.Sprintf("Re-resolved %d/%d domain(s), %d new host(s).",
 		changed, len(selected), len(added))
+}
+
+func parseResolvers(raw string, p Prompter) []netip.Addr {
+	var resolvers []netip.Addr
+	for _, r := range strings.Split(raw, ",") {
+		if r = strings.TrimSpace(r); r == "" {
+			continue
+		}
+		if a, err := netip.ParseAddr(r); err == nil {
+			resolvers = append(resolvers, a.WithZone(""))
+		} else {
+			p.Notify(fmt.Sprintf("! ignoring invalid resolver %q", r))
+		}
+	}
+	return resolvers
+}
+
+var ptrLookup = resolve.PTR
+
+// ResolvePTR looks up reverse DNS (PTR) hostnames for selected and sets
+// its domain label. If the host already has a different domain label, the
+// user is asked to confirm replacing it.
+func ResolvePTR(m *monitor.Monitor, p Prompter, opt DNSOptions, selected netip.Addr) string {
+	if !selected.IsValid() {
+		return "No host selected."
+	}
+	if _, ok := m.Target(selected); !ok {
+		return fmt.Sprintf("Host %s is no longer monitored.", selected)
+	}
+
+	resolvers := opt.Resolvers
+	if !opt.ResolversSet {
+		raw, err := p.Prompt(fmt.Sprintf(
+			"PTR lookup for %s — DNS resolver IP(s), comma separated, or blank for system: ", selected))
+		if err != nil {
+			return "PTR lookup cancelled."
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" || strings.EqualFold(raw, "system") {
+			resolvers = nil
+		} else {
+			resolvers = parseResolvers(raw, p)
+		}
+	}
+
+	names := ptrLookup(selected, resolvers)
+	if len(names) == 0 {
+		return fmt.Sprintf("No PTR record found for %s.", selected)
+	}
+	hostname := strings.Join(names, ", ")
+
+	cur, ok := m.Target(selected)
+	if !ok {
+		return fmt.Sprintf("Host %s is no longer monitored.", selected)
+	}
+	if cur.Domain == "" {
+		if !m.SetDomain(selected, hostname) {
+			return fmt.Sprintf("Host %s is no longer monitored.", selected)
+		}
+		return fmt.Sprintf("Set hostname for %s to %s", selected, hostname)
+	}
+	if strings.EqualFold(strings.TrimSpace(cur.Domain), hostname) {
+		return fmt.Sprintf("Hostname for %s is already %s.", selected, cur.Domain)
+	}
+	ans, err := p.Prompt(fmt.Sprintf("%s currently has hostname %q; replace with %q? (y/N): ",
+		selected, cur.Domain, hostname))
+	if err != nil {
+		return fmt.Sprintf("Hostname for %s left unchanged (%s).", selected, cur.Domain)
+	}
+	switch strings.ToLower(strings.TrimSpace(ans)) {
+	case "y", "yes":
+		if !m.SetDomain(selected, hostname) {
+			return fmt.Sprintf("Host %s is no longer monitored.", selected)
+		}
+		return fmt.Sprintf("Updated hostname for %s: %s -> %s", selected, cur.Domain, hostname)
+	default:
+		return fmt.Sprintf("Hostname for %s left unchanged (%s).", selected, cur.Domain)
+	}
 }

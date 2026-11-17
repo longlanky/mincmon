@@ -27,8 +27,10 @@ a add  r remove  d delete sel  s save  l load  o/O sort  / filter  ↑↓ select
 - **Native ICMP:** sends echo requests itself instead of running a `ping` process per probe. All hosts share one socket per address family, so a thousand hosts cost about as much CPU as a handful.
 - **IPv4 and IPv6** everywhere, including link-local addresses with zones (`fe80::1%eth0`).
 - **Subnets with refinement:** enter a CIDR, then pick exactly which host offsets or ranges to watch.
-- **Domains:** resolves A and/or AAAA records, from the system resolver or from DNS servers you choose. Each IP gets labeled with its domain.
-- **Live TUI:** scrollable, sortable, filterable host table with per-host loss % and a latency sparkline.
+- **Explicit ranges:** `192.168.1.10-192.168.1.50`, shorthand `192.168.1.10-50`, and IPv6 ranges sweep exactly the addresses you name.
+- **Delta monitoring:** switch to the `deltas` view for a live feed of state *changes only* — a host coming back up after being down (and how long it was down), hosts starting to flap, and hosts settling again. State changes need 3 consecutive probes by default, so one lost packet never cries wolf.
+- **Domains & reverse DNS:** resolves A and/or AAAA records, from the system resolver or from DNS servers you choose, and supports on-demand PTR (reverse DNS) hostname lookup (`n`) for monitored IPs. Each IP gets labeled with its domain.
+- **Live TUI:** starts in the classic `all` table and cycles four views (`all`, `up`, `down`, `deltas`) with `Tab`, with sorting, filtering, per-host loss %, and a latency sparkline.
 - **Saved monitor lists:** save the current host set to a simple `.ml.txt` file and load it later.
 - **Single static binary:** no libc, Python, or install step. Runs on old distros (e.g. EL8) as well as current ones.
 
@@ -106,6 +108,8 @@ mincmon 192.0.2.10 2001:db8::10 example.com
 mincmon -f infra.ml.txt                         # load a saved list
 mincmon -i 1s -t 500ms 10.0.0.0/24              # faster probing
 mincmon --resolver 1.1.1.1 --records A example.com
+mincmon 192.168.1.10-192.168.1.50               # sweep an explicit range
+mincmon --confirm 1 10.0.0.0/24                 # state changes on a single probe
 ```
 
 Flags must come before the targets.
@@ -117,6 +121,7 @@ Flags must come before the targets.
 | `-t timeout` | `1s` | How long to wait for a reply. |
 | `--resolver IPs` | ask | DNS server(s) for domains, comma separated, or `system`. |
 | `--records types` | ask | Record types to resolve: `A`, `AAAA`, or `both`. |
+| `--confirm n` | `3` | Consecutive probes (1–10) needed to confirm a state change before it counts as a delta. `1` = react to a single probe. Changeable live with `c`. |
 | `--backend name` | `auto` | Force a probe backend: `auto`, `icmp`, `raw`, or `exec`. |
 | `--version` | | Print the version and exit. |
 
@@ -128,7 +133,10 @@ Targets are comma separated, both on the command line and in the Add prompt:
 |---|---|
 | `192.0.2.10`, `2001:db8::1` | A single host. |
 | `10.0.0.0/24`, `10.0.0.0/255.255.255.0`, `2001:db8::/64` | A subnet. mincmon asks you to refine it (see below). |
+| `192.168.1.10-192.168.1.50`, `192.168.1.10-50`, `2001:db8::10-2001:db8::50` | An explicit range, both ends included. IPv4 shorthand gives just the last octet. Ranges may cross subnet boundaries; a range spanning more than 1024 hosts is skipped with a warning. |
 | `example.com` | A domain. mincmon asks which resolver and record types to use. |
+
+Across the whole session at most **1024 hosts** are monitored: an add, load, or re-resolve that would push the total past 1024 is refused (with the counts) and adds nothing.
 
 ### Subnet refinement
 
@@ -141,24 +149,43 @@ Refine 10.0.0.0/24 (decimal offsets/ranges, e.g. 1,10-20; blank = first 1024 hos
 - **IPv4** offsets are decimal: `1,10-20,254` gives `10.0.0.1`, `10.0.0.10`–`.20`, `10.0.0.254`.
 - **IPv6** offsets are hex, optionally `:`-grouped: `1,a-f,1:0` under `2001:db8::/64` gives `::1`, `::a`–`::f`, `::1:0`.
 - **Blank** means every usable host (network and broadcast are skipped for IPv4), capped at 1024. For subnets bigger than a /24 you'll be asked to confirm.
+- After a **blank** refinement you'll also be asked whether to include the network+broadcast addresses (IPv6: the subnet-router anycast address): `y` includes them for that subnet, `a` includes them for every subnet this session, Enter/`n` skips them as before. A refinement that literally lists offset `0` (or the last) always includes it.
 
 Any single subnet or refinement is capped at 1024 hosts.
+
+## Delta monitoring
+
+mincmon starts in the **all view** (the classic table). `Tab` cycles **all → up → down → deltas**; the title bar always shows the current view.
+
+- **Baseline, silently.** The first probe of each host — whenever it was added — sets its state without fanfare. The up/down/all views and the counts under the table show that baseline as soon as it exists.
+- **Confirmed changes only.** A host must answer (or miss) `--confirm` consecutive probes (default 3, key `c` changes it live, 1–10) before its state flips. While a flip is gathering evidence the status shows e.g. `UP ?2/3`; sparkline and loss still show every raw probe.
+- **The feed.** Each confirmed flip adds one newest-first line: when, which host, `DOWN→UP`, and how long it spent in the previous state (`(was down 4m32s)`). The last **500** events are kept (the header notes how many earlier ones were dropped). When you're in another view, the title bar shows a **`⚠ N new`** badge; opening deltas clears it.
+- **Flapping.** 4 confirmed changes within 5 minutes marks a host **FLAPPING** (4 within 1 minute escalates to **RAPID**): the feed gets one “started flapping” line instead of a line per flip, and a “settled as UP/DOWN” line after 5 stable minutes (2 for RAPID), with the number of changes that happened while flapping.
+- **Subnet clusters.** Below the feed, hosts that came from a subnet or range are grouped under a collapsed line (`▸ 10.0.0.0/24 — 180 up · 74 down`) in the order their subnets were first added. `Enter` expands/collapses a cluster inline; hosts with no origin (single IPs, domains, loaded lists) sit flat below the clusters. `Enter` on a feed line jumps to that host in the all view.
+- **Report.** `S` saves the feed as a plain-text report — header (time, probing parameters, current up/down/flapping counts) plus one line per event, e.g. `2026-11-11 09:41:03  192.168.1.5  DOWN→UP  (was down 4m32s)`. `s` still saves `.ml.txt` host lists.
+
+Removal is not a delta, and neither is the silent baseline of a host added mid-session.
 
 ## Keys
 
 | Key | Action |
 |---|---|
+| `Tab` / `Shift+Tab` | Cycle the view forwards/backwards: all → up → down → deltas. |
+| `Enter` | In deltas: expand/collapse the subnet cluster under the cursor, or jump from a change line to its host in the all view. |
 | `↑` `↓` / `j` `k` | Move the selection. |
-| `PgUp` `PgDn` / `Space` | Page through the table. |
-| `Home` `End` / `g` `G` | Jump to the first or last host. |
+| `PgUp` `PgDn` / `Space` | Page through the list. |
+| `Home` `End` / `g` `G` | Jump to the first or last row. |
 | `a` | Add targets (same prompts as at startup). |
-| `r` | Remove hosts by IP, subnet, or domain label. Leave blank to remove the selected host. |
+| `r` | Remove hosts by IP, range, subnet, or domain label. Leave blank to remove the selected host. |
 | `d` / `Delete` | Remove the selected host immediately. |
 | `s` | Save the current hosts to a `.ml.txt` file. |
+| `S` | Save the delta report (state-change log) as a plain-text file. |
 | `l` | Load a `.ml.txt` file from the current directory, or by path. |
 | `R` | Re-resolve domains: pick one/some/blank=all; resolver blank uses each domain's original resolver (saved provenance), `system`, or explicit IP(s). New addresses are added automatically. |
+| `n` | Look up the selected host's hostname via reverse DNS (PTR) — blank resolver uses system DNS, or enter resolver IP(s); prompts `y/N` before replacing a different existing hostname. |
+| `c` | Set how many consecutive probes confirm a state change (1–10; in-progress counters reset). |
 | `p` | Pause / resume probing (an in-flight probe finishes; `⏸ PAUSED` shows in the title bar). |
-| `o` / `O` | Cycle the sort column (added, IP, domain, state, latency, loss) / reverse it. |
+| `o` / `O` | Cycle the sort column (added, IP, domain, state, latency, loss) / reverse it (table views). |
 | `/` | Filter by IP, domain, or state. `Esc` clears the filter. |
 | `?` | Toggle the full-screen key reference. |
 | `q` / `Ctrl+C` | Quit. |
@@ -167,7 +194,7 @@ In a prompt, `Enter` submits and `Esc` cancels.
 
 ### Columns
 
-- **STATUS:** `● UP`, `○ DOWN`, or `◌ PENDING` (not probed yet).
+- **STATUS:** `● UP`, `○ DOWN`, or `◌ PENDING` (not probed yet), plus `?n/N` while a state change is being confirmed (n of N consecutive probes seen) and `FLAPPING` / `RAPID` for hosts changing too often.
 - **LATENCY:** round-trip time of the last successful probe.
 - **LOSS:** share of lost probes among the last 60.
 - **UP / DOWN:** total successful and failed probes since the host was added.
@@ -189,6 +216,8 @@ Saved lists are plain text with the `.ml.txt` extension. Each line holds one hos
 Lines are split on the **first** comma only. If one IP was resolved from several domains, its label lists them all (`web.example.com, www.example.com`). A segment after the **last** comma that parses as an IP address is the resolver (domain names can never be IPs, so merged labels are never mistaken for one). Lines with an invalid IP are skipped.
 
 The resolver field is provenance: re-resolving a domain (`R`, blank resolver) queries the server that originally produced it — or the system resolver when omitted. Lists saved by older versions (two fields only) load unchanged.
+
+One thing lists do *not* record is which subnet or range a host came from, so hosts loaded from a list appear flat (ungrouped) in the deltas view rather than under a subnet cluster.
 
 The repo's `.gitignore` excludes `*.ml.txt`, because saved lists tend to describe private infrastructure. The exception is `example.ml.txt`, a tracked starter list of public DNS resolvers — try it with `mincmon -f example.ml.txt`.
 
